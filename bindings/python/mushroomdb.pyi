@@ -31,6 +31,9 @@ class GraphDb:
 
     One writer at a time across processes. A handle sees commits made through
     it plus, after `refresh()`, everything other processes have committed.
+
+    `scoped()` returns a read-only child of this handle that applies a scope to
+    every read — see its docstring for the contract.
     """
 
     @staticmethod
@@ -39,6 +42,40 @@ class GraphDb:
 
         Raises `MushroomBusy` if another read-write handle is open. Pass
         `read_only=True` for a handle that never writes and never waits.
+        """
+
+    def scoped(
+        self,
+        role: str | None = None,
+        namespace: str | None = None,
+        keys: Sequence[str] | None = None,
+    ) -> GraphDb:
+        """A child handle that scopes **every** read and refuses every write.
+
+        It shares this handle's store and mutex — not a second open, no second
+        lock, one small allocation — so `close()` on either name closes both.
+
+        At least one leg is required; none raises `ValueError`. Legs intersect,
+        so `scoped()` on a scoped handle narrows further and never widens, and
+        `keys=[]` narrows to nothing. An unknown `role` raises here, not on the
+        first read.
+
+        Every read obeys one contract: the subject is checked first, so a key
+        outside the scope is indistinguishable from a key that does not exist —
+        `node_info` answers `None`, `node_edges` raises `KeyNotFound`,
+        `node_history` is empty. Then every other node the answer would mention
+        — neighbour, endpoint, candidate, evidence — is filtered to the scope,
+        so `degree` counts only visible neighbours and `find_similar`,
+        `pairwise_similar` and `search_hybrid` score only visible candidates.
+
+        The scope resolves per read, so a handle held across a write is never
+        stale. `refresh()` is permitted. `has_vector_rule` and
+        `is_index_enabled` answer unscoped: they are schema, not node data.
+
+        ```python
+        s = db.scoped(role="reader-a")
+        t = db.scoped(namespace="tenant-a", keys=visible_ids)
+        ```
         """
 
     def insert_node(
@@ -251,10 +288,17 @@ class GraphDb:
         """Write a durable snapshot and truncate the WAL tail."""
 
     def refresh(self) -> int:
-        """Apply other processes' commits; return how many were applied."""
+        """Apply other processes' commits; return how many were applied.
+
+        Writes nothing, so a `read_only=True` handle and a `scoped()` one may
+        both call it.
+        """
 
     def close(self) -> None:
-        """Close the handle and release the store."""
+        """Close the handle and release the store.
+
+        A `scoped()` child shares the one store, so either name closes both.
+        """
 
     def __enter__(self) -> GraphDb: ...
     def __exit__(

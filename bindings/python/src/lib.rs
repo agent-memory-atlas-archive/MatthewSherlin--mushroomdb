@@ -1,7 +1,8 @@
 use core_api::{
     default_max_edges, valid_namespace, AlgoDir, AsOfScope, Direction, EdgeAt, Explanation,
-    GraphDb as CoreDb, GraphError, HistoryChange, HistoryEntry, NodeInfo, NodeMask,
-    PredicateSummary, PropPredicate, ResultSet, RuleDef, Value, NS_MAX_LEN, NS_PROP,
+    GraphDb as CoreDb, GraphError, HistoryChange, HistoryEntry, MaskedNodeResult, NamespaceStats,
+    NodeInfo, NodeMask, PredicateSummary, PropPredicate, ResultSet, RuleDef, Scope, Value,
+    NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -9,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 type Db = CoreDb<RealFs>;
 
@@ -17,7 +18,16 @@ struct Inner(Mutex<Option<Db>>);
 
 #[pyclass(name = "GraphDb")]
 struct GraphDb {
-    inner: Inner,
+    /// The store, shared with every handle `scoped()` produced from this one.
+    /// One store, one mutex: a child is an allocation, not a second open.
+    inner: Arc<Inner>,
+    /// What this handle may read, or `None` for an unscoped one.
+    ///
+    /// Held as a descriptor rather than a resolved [`NodeMask`] on purpose: a
+    /// mask cached here would be the allow-list the store had when the handle
+    /// was built, and a handle held across a write would serve it afterwards.
+    /// That is a leak, not a staleness bug — so every read resolves again.
+    scope: Option<Scope>,
 }
 
 #[pymethods]
@@ -42,7 +52,76 @@ impl GraphDb {
         };
         let db = CoreDb::open_with_options(&path, opts).map_err(graph_err)?;
         Ok(GraphDb {
-            inner: Inner(Mutex::new(Some(db))),
+            inner: Arc::new(Inner(Mutex::new(Some(db)))),
+            scope: None,
+        })
+    }
+
+    /// A child handle that applies a read scope to **every** read and refuses
+    /// every write.
+    ///
+    /// It shares this handle's store and mutex: it is not a second open, it
+    /// takes no lock, and it costs one small allocation. `close()` on either
+    /// name closes the one store they share.
+    ///
+    /// At least one of `role`, `namespace` and `keys` is required — an empty
+    /// scope is a `ValueError`, never a handle that quietly reads everything.
+    /// Present legs **intersect**, so `scoped()` on a scoped handle narrows
+    /// further and can never widen. `keys=[]` is a leg: it narrows to nothing.
+    ///
+    /// The contract every read obeys:
+    ///
+    /// > The subject is checked first, so a key outside the scope is
+    /// > indistinguishable from a key that does not exist. Then every other
+    /// > node the answer would mention — neighbour, endpoint, candidate,
+    /// > evidence — is filtered to the scope.
+    ///
+    /// The scope is resolved **per read**, so a handle held across a write
+    /// answers from the store as it is now: a key created since is visible, a
+    /// key deleted since is not. An unknown `role` raises here rather than on
+    /// the first read, so a typo cannot produce a working-looking handle.
+    ///
+    /// `refresh()` is permitted — it writes nothing. `has_vector_rule` and
+    /// `is_index_enabled` answer unscoped: they are schema facts, not node data.
+    ///
+    /// ```python
+    /// s = db.scoped(role="reader-a")
+    /// t = db.scoped(namespace="tenant-a", keys=visible_ids)
+    /// s.node_info("something-else-entirely")   # None, as for an absent key
+    /// ```
+    #[pyo3(
+        signature = (role = None, namespace = None, keys = None),
+        text_signature = "($self, role=None, namespace=None, keys=None)"
+    )]
+    fn scoped(
+        &self,
+        role: Option<String>,
+        namespace: Option<String>,
+        keys: Option<Vec<String>>,
+    ) -> PyResult<GraphDb> {
+        if role.is_none() && namespace.is_none() && keys.is_none() {
+            return Err(PyValueError::new_err(
+                "scoped() needs at least one of role, namespace or keys; an empty scope is \
+                 refused rather than read as unscoped",
+            ));
+        }
+        check_namespace(namespace.as_deref())?;
+        let leg = Scope::new(role, namespace, keys).map_err(graph_err)?;
+        let scope = match &self.scope {
+            Some(parent) => parent.intersect(&leg),
+            None => leg,
+        };
+
+        // Resolve once, eagerly, and throw the mask away. `Scope::new` takes no
+        // store, so it cannot tell a real role name from a typo; without this
+        // the refusal would surface on some later read instead, on a handle the
+        // caller has already handed out. Per-read resolution is unchanged — the
+        // mask this builds is deliberately not kept.
+        self.with_ref(|db| scope.resolve(db).map(|_| ()))?;
+
+        Ok(GraphDb {
+            inner: Arc::clone(&self.inner),
+            scope: Some(scope),
         })
     }
 
@@ -55,9 +134,12 @@ impl GraphDb {
     /// `read_only=True` handle can refresh freely.
     ///
     /// A commit another process is still writing is left for the next call.
+    ///
+    /// A scoped handle may refresh: it writes nothing, and the scope applies to
+    /// what the refreshed store then answers.
     #[pyo3(text_signature = "($self)")]
     fn refresh(&self) -> PyResult<u64> {
-        self.with_mut(|db| db.refresh())
+        self.with_mut_unscoped(|db| db.refresh())
     }
 
     /// Insert a new node.  Raises `RuntimeError` (`DuplicateKey`) if `key` is
@@ -243,26 +325,26 @@ impl GraphDb {
     ) -> PyResult<Vec<Py<PyDict>>> {
         let map = params_to_map(params)?;
         let namespace = check_namespace(namespace)?;
-        let rs = if role.is_some() || namespace.is_some() {
+        let rs = self.with_scope(|db, scope_mask| {
             // One mask per leg, intersected — the same never-widen composition
             // every other surface uses. A role bound to namespaces honours them
             // with no `namespace` here; one outside its binding is the empty
             // intersection, never the union. Either argument makes the call a
             // read: a masked write raises.
-            self.with_ref(|db| {
-                let mask = match (role, namespace) {
-                    (Some(role), Some(ns)) => db
-                        .mask_for_role(role)?
+            let call_mask = match (role, namespace) {
+                (Some(role), Some(ns)) => Some(
+                    db.mask_for_role(role)?
                         .intersect(&db.mask_for_namespace(ns)),
-                    (Some(role), None) => db.mask_for_role(role)?,
-                    (None, Some(ns)) => db.mask_for_namespace(ns),
-                    (None, None) => unreachable!("one of the two is Some in this branch"),
-                };
-                db.query_masked(cypher, &map, &mask)
-            })?
-        } else {
-            self.with_ref(|db| db.query(cypher, &map))?
-        };
+                ),
+                (Some(role), None) => Some(db.mask_for_role(role)?),
+                (None, Some(ns)) => Some(db.mask_for_namespace(ns)),
+                (None, None) => None,
+            };
+            match narrow(scope_mask, call_mask) {
+                Some(mask) => db.query_masked(cypher, &map, &mask),
+                None => db.query(cypher, &map),
+            }
+        })?;
         result_set_to_rows(py, &rs)
     }
 
@@ -301,7 +383,10 @@ impl GraphDb {
             let val = py_to_value(&tuple.get_item(1)?)?;
             map.insert(name, val);
         }
-        let rs = self.with_ref(|db| db.query(cypher, &map))?;
+        let rs = self.with_scope(|db, mask| match mask {
+            Some(mask) => db.query_masked(cypher, &map, mask),
+            None => db.query(cypher, &map),
+        })?;
         result_set_to_rows(py, &rs)
     }
 
@@ -454,10 +539,11 @@ impl GraphDb {
             None
         };
         py.allow_threads(|| {
-            self.with_ref(|db| {
-                let node_mask = mask_keys
+            self.with_scope(|db, scope_mask| {
+                let call_mask = mask_keys
                     .as_ref()
                     .map(|keys| NodeMask::from_keys(db, keys.iter().map(String::as_str)));
+                let node_mask = narrow(scope_mask, call_mask);
                 db.find_similar_vector_filtered(
                     &field,
                     label.as_deref(),
@@ -496,9 +582,15 @@ impl GraphDb {
     ) -> PyResult<Vec<(String, Vec<(String, f64)>)>> {
         let field = field.to_owned();
         py.allow_threads(|| {
-            self.with_ref(|db| {
+            self.with_scope(|db, mask| {
                 let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-                db.pairwise_similar(&refs, &field, k, min)
+                match mask {
+                    // Hidden keys leave the input before the matmul, not the
+                    // answer afterwards: a hidden vector packed into the Gram
+                    // can take a visible neighbour's place in the top-k.
+                    Some(mask) => db.pairwise_similar_scoped(&refs, &field, k, min, mask),
+                    None => db.pairwise_similar(&refs, &field, k, min),
+                }
             })
         })
     }
@@ -535,7 +627,23 @@ impl GraphDb {
         k: usize,
     ) -> PyResult<Vec<(String, f64)>> {
         let q = pylist_to_f64_vec(&vector)?;
-        self.with_ref(|db| Ok(db.search_hybrid(text_field, query_text, vector_field, &q, label, k)))
+        self.with_scope(|db, mask| {
+            Ok(match mask {
+                // Both legs are filtered before the fusion, so the ranks that
+                // enter RRF are the ranks of the visible corpus and `k` is
+                // honoured. Filtering the fused list would quietly return fewer.
+                Some(mask) => db.search_hybrid_scoped(
+                    text_field,
+                    query_text,
+                    vector_field,
+                    &q,
+                    label,
+                    k,
+                    mask,
+                ),
+                None => db.search_hybrid(text_field, query_text, vector_field, &q, label, k),
+            })
+        })
     }
 
     /// Read a single property from an edge.
@@ -556,7 +664,19 @@ impl GraphDb {
         dst_key: &str,
         field: &str,
     ) -> PyResult<Py<PyAny>> {
-        let val = self.with_ref(|db| Ok(db.get_edge_prop(edge_type, src_key, dst_key, field)))?;
+        let val = self.with_scope(|db, mask| {
+            Ok(match mask {
+                // An edge one of whose endpoints is hidden reads as an edge
+                // that is not there, which is what an unresolvable key already
+                // returns.
+                Some(mask)
+                    if !(mask.contains_node(db, src_key) && mask.contains_node(db, dst_key)) =>
+                {
+                    None
+                }
+                _ => db.get_edge_prop(edge_type, src_key, dst_key, field),
+            })
+        })?;
         match val {
             Some(v) => value_to_py(py, &v).map(|b| b.unbind()),
             None => Ok(py.None()),
@@ -600,6 +720,9 @@ impl GraphDb {
         rule: Bound<'_, PyAny>,
         if_not_exists: bool,
     ) -> PyResult<bool> {
+        // `if_not_exists` can return before the write path, so this one needs
+        // its own refusal rather than `with_mut`'s.
+        self.refuse_if_scoped()?;
         let def = rule_from_py(py, &rule)?;
         if if_not_exists {
             let name = def.name.clone();
@@ -619,7 +742,13 @@ impl GraphDb {
     /// accepts verbatim.
     #[pyo3(text_signature = "($self, a, b)")]
     fn explain(&self, py: Python<'_>, a: &str, b: &str) -> PyResult<Vec<Py<PyDict>>> {
-        let rows = self.with_ref(|db| db.explain(a, b))?;
+        let rows = self.with_scope(|db, mask| match mask {
+            // An explanation whose evidence runs through a hidden node is
+            // dropped whole, not redacted: it names the hop's edge type and
+            // never the hop's key, so there is no field to blank.
+            Some(mask) => db.explain_scoped(a, b, mask),
+            None => db.explain(a, b),
+        })?;
         rows.iter().map(|e| explanation_to_py(py, e)).collect()
     }
 
@@ -628,7 +757,22 @@ impl GraphDb {
     #[pyo3(text_signature = "($self, key, edge_type, direction)")]
     fn neighbors(&self, key: &str, edge_type: &str, direction: &str) -> PyResult<Vec<String>> {
         let dir = parse_dir(direction)?;
-        self.with_ref(|db| db.neighbors(key, edge_type, dir))
+        self.with_scope(|db, mask| match mask {
+            // The one-hop shape of `neighborhood`: subject first, then the
+            // neighbours themselves. At depth 1 "never crosses a hidden node"
+            // and "never names one" are the same filter.
+            Some(mask) => {
+                if !mask.contains_node(db, key) {
+                    return Err(GraphError::KeyNotFound { key: key.into() });
+                }
+                Ok(db
+                    .neighbors(key, edge_type, dir)?
+                    .into_iter()
+                    .filter(|n| mask.contains_node(db, n))
+                    .collect())
+            }
+            None => db.neighbors(key, edge_type, dir),
+        })
     }
 
     /// Unique directed degree of `key`. `direction` is `"out"`, `"in"`, or
@@ -648,7 +792,14 @@ impl GraphDb {
         let dir = parse_algo_dir(direction)?;
         let key = key.to_owned();
         let edge_type = edge_type.map(str::to_owned);
-        py.allow_threads(|| self.with_ref(|db| db.degree(&key, edge_type.as_deref(), dir)))
+        py.allow_threads(|| {
+            self.with_scope(|db, mask| match mask {
+                // Counting hidden neighbours would disclose their existence by
+                // arithmetic — the same leak the edge filter prevents.
+                Some(mask) => db.degree_scoped(&key, edge_type.as_deref(), dir, mask),
+                None => db.degree(&key, edge_type.as_deref(), dir),
+            })
+        })
     }
 
     /// Unique directed degree for a key subset or a label scan.
@@ -680,15 +831,27 @@ impl GraphDb {
         let label = label.map(str::to_owned);
         let edge_type = edge_type.map(str::to_owned);
         py.allow_threads(|| {
-            self.with_ref(|db| {
-                db.degrees(
+            self.with_scope(|db, mask| match mask {
+                // Hidden keys leave both sides: the input — whether they
+                // arrived in `keys` or came out of the label/`where` scan — and
+                // every row's count.
+                Some(mask) => db.degrees_scoped(
                     keys.as_deref(),
                     label.as_deref(),
                     pred.as_ref(),
                     edge_type.as_deref(),
                     dir,
                     limit,
-                )
+                    mask,
+                ),
+                None => db.degrees(
+                    keys.as_deref(),
+                    label.as_deref(),
+                    pred.as_ref(),
+                    edge_type.as_deref(),
+                    dir,
+                    limit,
+                ),
             })
         })
     }
@@ -700,7 +863,18 @@ impl GraphDb {
     /// Returns `{"key", "label", "props"}`.
     #[pyo3(text_signature = "($self, key)")]
     fn node_info(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyDict>>> {
-        let info = self.with_ref(|db| Ok(db.node_info(key)))?;
+        let info = self.with_scope(|db, mask| {
+            Ok(match mask {
+                // `Omit` mode, always: a hidden node reads as an absent one
+                // rather than as a restricted stub, which would disclose that
+                // it exists.
+                Some(mask) => match db.node_info_masked(key, mask) {
+                    Some(MaskedNodeResult::Visible(info)) => Some(info),
+                    _ => None,
+                },
+                None => db.node_info(key),
+            })
+        })?;
         match info {
             Some(info) => Ok(Some(node_info_to_py(py, &info)?)),
             None => Ok(None),
@@ -714,7 +888,12 @@ impl GraphDb {
     /// Each dict is `{"edge_type", "src_key", "dst_key", "derived"}`.
     #[pyo3(text_signature = "($self, key)")]
     fn node_edges(&self, py: Python<'_>, key: &str) -> PyResult<Vec<Py<PyDict>>> {
-        let edges = self.with_ref(|db| db.node_edges(key))?;
+        let edges = self.with_scope(|db, mask| match mask {
+            // Hidden subject → `KeyNotFound`, exactly as an unknown key; then
+            // every edge naming a hidden endpoint is dropped.
+            Some(mask) => db.node_edges_scoped(key, mask),
+            None => db.node_edges(key),
+        })?;
         edges
             .iter()
             .map(|e| {
@@ -750,7 +929,18 @@ impl GraphDb {
     /// Whether `a` and `b` were linked by `edge_type` at or before `at_commit`.
     #[pyo3(text_signature = "($self, a, b, edge_type, at_commit)")]
     fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> PyResult<bool> {
-        self.with_ref(|db| db.was_linked(a, b, edge_type, at_commit))
+        self.with_scope(|db, mask| {
+            // The real call runs first so an out-of-range `at_commit` raises
+            // for a hidden pair exactly as it does for an unknown one; only
+            // then is the answer narrowed. An unknown key here is `False`, not
+            // an error, so a hidden one is `False` too — raising would say
+            // "this key exists but you may not see it".
+            let linked = db.was_linked(a, b, edge_type, at_commit)?;
+            Ok(match mask {
+                Some(mask) => linked && mask.contains_node(db, a) && mask.contains_node(db, b),
+                None => linked,
+            })
+        })
     }
 
     /// Time-travel read: run `cypher` against the graph as it existed at
@@ -775,21 +965,33 @@ impl GraphDb {
     ) -> PyResult<Vec<Py<PyDict>>> {
         let map = params_to_map(params)?;
         let namespace = check_namespace(namespace)?;
-        let rs = if role.is_some() || namespace.is_some() {
-            self.with_ref(|db| match (role, namespace) {
-                (Some(role), Some(ns)) => {
-                    db.query_at_scoped_in_namespace(commit, cypher, &map, AsOfScope::Role(role), ns)
-                }
-                (Some(role), None) => {
-                    db.query_at_scoped(commit, cypher, &map, AsOfScope::Role(role))
-                }
-                (None, Some(ns)) => {
-                    db.query_at_scoped(commit, cypher, &map, AsOfScope::Namespace(ns))
-                }
-                (None, None) => unreachable!("one of the two is Some in this branch"),
-            })?
-        } else {
-            self.with_ref(|db| db.query_at(commit, cypher, &map))?
+        // On a scoped handle the whole scope goes down, narrowed by any
+        // per-call legs: `AsOfScope` names one restriction and cannot spell a
+        // nested scope's several. The legs resolve against the as-of graph, so
+        // a resolved live mask would be the wrong answer, not just a stale one.
+        let rs = match self.scope_narrowed_by(role, namespace)? {
+            Some(scope) => {
+                self.with_ref(|db| db.query_at_with_scope(commit, cypher, &map, &scope))?
+            }
+            None if role.is_some() || namespace.is_some() => {
+                self.with_ref(|db| match (role, namespace) {
+                    (Some(role), Some(ns)) => db.query_at_scoped_in_namespace(
+                        commit,
+                        cypher,
+                        &map,
+                        AsOfScope::Role(role),
+                        ns,
+                    ),
+                    (Some(role), None) => {
+                        db.query_at_scoped(commit, cypher, &map, AsOfScope::Role(role))
+                    }
+                    (None, Some(ns)) => {
+                        db.query_at_scoped(commit, cypher, &map, AsOfScope::Namespace(ns))
+                    }
+                    (None, None) => unreachable!("one of the two is Some in this branch"),
+                })?
+            }
+            None => self.with_ref(|db| db.query_at(commit, cypher, &map))?,
         };
         result_set_to_rows(py, &rs)
     }
@@ -801,7 +1003,25 @@ impl GraphDb {
     /// events before it were pruned and are not in `history`.
     #[pyo3(text_signature = "($self, key)")]
     fn node_history(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyDict>> {
-        let result = self.with_ref(|db| db.node_history(key))?;
+        let result = self.with_scope(|db, mask| {
+            let mut result = db.node_history(key)?;
+            if let Some(mask) = mask {
+                if mask.contains_node(db, key) {
+                    // Every other node the history names is an edge partner.
+                    result.items.retain(|e| match &e.change {
+                        HistoryChange::EdgeAdded { other, .. }
+                        | HistoryChange::EdgeRemoved { other, .. } => mask.contains_node(db, other),
+                        _ => true,
+                    });
+                } else {
+                    // An unknown key has an empty history rather than an error,
+                    // so a hidden one does too — `KeyNotFound` here would be an
+                    // existence oracle in reverse.
+                    result.items.clear();
+                }
+            }
+            Ok(result)
+        })?;
         let history = result
             .items
             .iter()
@@ -830,7 +1050,17 @@ impl GraphDb {
     /// still retained — events before it were pruned and are not in `events`.
     #[pyo3(text_signature = "($self, a, b)")]
     fn edge_history(&self, py: Python<'_>, a: &str, b: &str) -> PyResult<Py<PyDict>> {
-        let result = self.with_ref(|db| db.edge_history(a, b))?;
+        let result = self.with_scope(|db, mask| {
+            let mut result = db.edge_history(a, b)?;
+            if let Some(mask) = mask {
+                // Every event here is about the pair, so one hidden endpoint
+                // empties the list — the answer an unknown key already gives.
+                if !(mask.contains_node(db, a) && mask.contains_node(db, b)) {
+                    result.items.clear();
+                }
+            }
+            Ok(result)
+        })?;
         let events = result
             .items
             .iter()
@@ -871,7 +1101,25 @@ impl GraphDb {
     /// unknown key is not an error — it simply had no edges.
     #[pyo3(text_signature = "($self, key, commit)")]
     fn edges_at(&self, py: Python<'_>, key: &str, commit: u64) -> PyResult<Vec<Py<PyDict>>> {
-        let edges = self.with_ref(|db| db.edges_at(key, commit))?;
+        let edges = self.with_scope(|db, mask| {
+            // Run first so an out-of-range `commit` raises for a hidden key as
+            // it does for an unknown one.
+            let edges = db.edges_at(key, commit)?;
+            Ok(match mask {
+                // An unknown key here is an empty list, not an error, so a
+                // hidden subject is one too; then hidden endpoints drop out.
+                // Endpoints are reported under the names they carry *today*, so
+                // today's mask is the right one to test them against.
+                Some(mask) if !mask.contains_node(db, key) => Vec::new(),
+                Some(mask) => edges
+                    .into_iter()
+                    .filter(|e| {
+                        mask.contains_node(db, &e.src_key) && mask.contains_node(db, &e.dst_key)
+                    })
+                    .collect(),
+                None => edges,
+            })
+        })?;
         edges.iter().map(|e| edge_at_to_py(py, e)).collect()
     }
 
@@ -898,7 +1146,23 @@ impl GraphDb {
             ));
         }
         let v = py_to_value(&value)?;
-        let wi = self.with_ref(|db| db.what_if_set_prop(key, field, v))?;
+        let wi = self.with_scope(|db, mask| match mask {
+            Some(mask) => {
+                // Unlike the history surfaces, `what_if_set_prop` *does* raise
+                // `KeyNotFound` for an unknown key, so a hidden one raises too.
+                if !mask.contains_node(db, key) {
+                    return Err(GraphError::KeyNotFound { key: key.into() });
+                }
+                let mut wi = db.what_if_set_prop(key, field, v)?;
+                let visible = |e: &EdgeAt| {
+                    mask.contains_node(db, &e.src_key) && mask.contains_node(db, &e.dst_key)
+                };
+                wi.lost.retain(visible);
+                wi.gained.retain(visible);
+                Ok(wi)
+            }
+            None => db.what_if_set_prop(key, field, v),
+        })?;
         let lost = wi
             .lost
             .iter()
@@ -1085,7 +1349,27 @@ impl GraphDb {
     /// `/stats` JSON response.
     #[pyo3(text_signature = "($self)")]
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let s = self.with_ref(|db| Ok(db.stats()))?;
+        let s = self.with_scope(|db, mask| {
+            let mut s = db.stats();
+            if let Some(mask) = mask {
+                // Store-wide counts stay store-wide, but the namespace roster
+                // is node data: it names which tenants exist and how many nodes
+                // each holds. A name with nothing visible in it drops out, and
+                // the counts that remain are counts of visible nodes.
+                s.namespaces = s
+                    .namespaces
+                    .iter()
+                    .filter_map(|n| {
+                        let visible = mask.intersect(&db.mask_for_namespace(&n.name)).len();
+                        (visible > 0).then(|| NamespaceStats {
+                            name: n.name.clone(),
+                            nodes_live: visible,
+                        })
+                    })
+                    .collect();
+            }
+            Ok(s)
+        })?;
         let d = PyDict::new(py);
         d.set_item("nodes_live", s.nodes_live)?;
         d.set_item("nodes_tombstoned", s.nodes_tombstoned)?;
@@ -1126,6 +1410,9 @@ impl GraphDb {
     /// Close the handle and release the store.  Further calls raise
     /// `RuntimeError`.  `GraphDb` is also a context manager, so
     /// `with GraphDb.open(path) as db:` closes on exit.
+    ///
+    /// A handle from `scoped()` shares the one store, so closing either name
+    /// closes it for both. Closing is not a write, so a scoped handle may.
     #[pyo3(text_signature = "($self)")]
     fn close(&self) -> PyResult<()> {
         let mut guard = lock(&self.inner.0)?;
@@ -1149,7 +1436,21 @@ impl GraphDb {
 }
 
 impl GraphDb {
+    /// Every mutation goes through here, so the scoped refusal is one check
+    /// rather than one per method — a write surface added later is refused
+    /// without anyone remembering to refuse it.
+    ///
+    /// `refresh()` is the one caller that wants the `&mut Db` without the
+    /// refusal, and it uses [`GraphDb::with_mut_unscoped`] directly.
     fn with_mut<T, F>(&self, f: F) -> PyResult<T>
+    where
+        F: FnOnce(&mut Db) -> core_api::Result<T>,
+    {
+        self.refuse_if_scoped()?;
+        self.with_mut_unscoped(f)
+    }
+
+    fn with_mut_unscoped<T, F>(&self, f: F) -> PyResult<T>
     where
         F: FnOnce(&mut Db) -> core_api::Result<T>,
     {
@@ -1158,6 +1459,21 @@ impl GraphDb {
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
         f(db).map_err(graph_err)
+    }
+
+    /// Refuse the call when this handle came from `scoped()`.
+    ///
+    /// Task 7 gives this its own `MushroomReadOnly` class; until then it is a
+    /// `RuntimeError`, which every existing `except RuntimeError` already
+    /// catches.
+    fn refuse_if_scoped(&self) -> PyResult<()> {
+        if self.scope.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "this handle is scoped, and a scoped handle never writes; call this on the \
+                 handle scoped() was called on",
+            ));
+        }
+        Ok(())
     }
 
     fn with_ref<T, F>(&self, f: F) -> PyResult<T>
@@ -1169,6 +1485,60 @@ impl GraphDb {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
         f(db).map_err(graph_err)
+    }
+
+    /// Run a read with this handle's scope resolved for **this** read.
+    ///
+    /// `f` gets `None` on an unscoped handle and `Some(mask)` on a scoped one,
+    /// so each method spells out its own scoped contract beside its unscoped
+    /// one. Resolution happens inside the lock, against the store the read is
+    /// about to run on, which is what keeps the allow-list from going stale
+    /// across a write.
+    fn with_scope<T, F>(&self, f: F) -> PyResult<T>
+    where
+        F: FnOnce(&Db, Option<&NodeMask>) -> core_api::Result<T>,
+    {
+        let guard = lock(&self.inner.0)?;
+        let db = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
+        let mask = match &self.scope {
+            Some(scope) => Some(scope.resolve(db).map_err(graph_err)?),
+            None => None,
+        };
+        f(db, mask.as_ref()).map_err(graph_err)
+    }
+
+    /// This handle's scope narrowed by a per-call `role=` / `namespace=` pair.
+    ///
+    /// Used by the time-travel read, where the legs must be resolved against
+    /// the as-of graph rather than the live one, so a resolved mask is no use.
+    fn scope_narrowed_by(
+        &self,
+        role: Option<&str>,
+        namespace: Option<&str>,
+    ) -> PyResult<Option<Scope>> {
+        let Some(handle) = self.scope.as_ref() else {
+            return Ok(None);
+        };
+        if role.is_none() && namespace.is_none() {
+            return Ok(Some(handle.clone()));
+        }
+        let call = Scope::new(role.map(str::to_owned), namespace.map(str::to_owned), None)
+            .map_err(graph_err)?;
+        Ok(Some(handle.intersect(&call)))
+    }
+}
+
+/// The scope's mask narrowed by a per-call one, when either is present.
+///
+/// The intersection is the never-widen rule: a per-call `mask=` can only take
+/// nodes away from what the handle already allows.
+fn narrow(scope: Option<&NodeMask>, call: Option<NodeMask>) -> Option<NodeMask> {
+    match (scope, call) {
+        (Some(s), Some(c)) => Some(s.intersect(&c)),
+        (Some(s), None) => Some(s.clone()),
+        (None, c) => c,
     }
 }
 

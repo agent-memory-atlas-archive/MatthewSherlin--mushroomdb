@@ -2025,6 +2025,44 @@ impl GraphDb<RealFs> {
         temporal.query_masked(cypher, params, &mask)
     }
 
+    /// Run a **read-only** Cypher query at `commit`, restricted by a
+    /// [`Scope`](crate::mask::Scope).
+    ///
+    /// [`AsOfScope`] names *one* restriction — a role, a key list, a namespace,
+    /// or a role-and-keys pair. A `Scope` is the general shape a handle carries,
+    /// and nesting can give it several role or namespace legs at once, so it
+    /// cannot be spelled as an `AsOfScope`. This is the entry point a scoped
+    /// handle uses for time travel; `query_at_scoped` stays the way to ask for
+    /// one named restriction.
+    ///
+    /// Both the graph and the scope's key and namespace legs are resolved
+    /// against `commit`; a role's *definition* is the current one, because
+    /// `roles.json` is a sidecar with no past version — the same split
+    /// [`GraphDb::query_at_scoped`] documents.
+    ///
+    /// The scope resolves **cold** here: its key memo is keyed on `commit_seq`,
+    /// which is a per-handle number, so filling it from a temporal handle could
+    /// hand that allow-list back to a live read. See
+    /// [`Scope::resolve_uncached`](crate::mask::Scope::resolve_uncached).
+    ///
+    /// # Errors
+    /// - [`GraphError::CommitOutOfRange`] if `commit` is outside the retained
+    ///   range; the error carries that range.
+    /// - [`GraphError::KeyNotFound`] with a `role:` prefix for an unknown role,
+    ///   or [`GraphError::Corrupt`] when `roles.json` was corrupt at open.
+    /// - A query error for a malformed or write query.
+    pub fn query_at_with_scope(
+        &self,
+        commit: u64,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+        scope: &crate::mask::Scope,
+    ) -> Result<ResultSet> {
+        let temporal = self.open_at_for_read(commit, cypher)?;
+        let mask = scope.resolve_uncached(&temporal)?;
+        temporal.query_masked(cypher, params, &mask)
+    }
+
     /// Open the temporal view for a time-travel read and refuse write Cypher.
     ///
     /// Shared by [`GraphDb::query_at`] and [`GraphDb::query_at_scoped`] so both

@@ -652,3 +652,58 @@ fn a_masked_search_without_exact_warns_once() {
         "once per index — a per-call line would be noise a caller learns to skip"
     );
 }
+
+/// A time-travel read through a handle's `Scope` (§5.3, the `query_at` row).
+///
+/// `AsOfScope` names one restriction — a role, a key list, a namespace, or a
+/// role-and-keys pair — and cannot express the general scope a nested
+/// `scoped()` builds. This is the entry point the Python child handle needs,
+/// and both legs resolve against the **as-of** graph.
+#[test]
+fn scoped_query_at_answers_the_as_of_graph_through_the_handles_scope() {
+    let dir = tmp("query-at-scope");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Doc", "a", vec![]).unwrap();
+    db.insert_node("Doc", "hidden", vec![]).unwrap();
+    db.insert_node("Doc", "late", vec![]).unwrap();
+
+    let scope = core_api::Scope::new(None, None, Some(vec!["a".into(), "late".into()])).unwrap();
+    let params = std::collections::BTreeMap::new();
+    let q = "MATCH (n:Doc) RETURN key(n) AS k ORDER BY k";
+    let newest = db.wal_total_commits().unwrap() - 1;
+
+    let live = db.query_at_with_scope(newest, q, &params, &scope).unwrap();
+    assert_eq!(keys_of(&live), vec!["a", "late"], "`hidden` is never named");
+
+    let then = db.query_at_with_scope(0, q, &params, &scope).unwrap();
+    assert_eq!(
+        keys_of(&then),
+        vec!["a"],
+        "the key leg resolves against the graph as it was at that commit"
+    );
+
+    // The as-of read leaves the live answer alone: the same scope, resolved
+    // again against the live store, still sees both keys.
+    let again = db.query_at_with_scope(newest, q, &params, &scope).unwrap();
+    assert_eq!(keys_of(&again), vec!["a", "late"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A scoped time-travel read is still a read.
+#[test]
+fn scoped_query_at_refuses_a_write_statement() {
+    let dir = tmp("query-at-scope-write");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Doc", "a", vec![]).unwrap();
+    let scope = core_api::Scope::new(None, None, Some(vec!["a".into()])).unwrap();
+    let params = std::collections::BTreeMap::new();
+
+    let err = db
+        .query_at_with_scope(0, "CREATE (n:Doc {id: 'z'})", &params, &scope)
+        .expect_err("a write statement on a temporal view is refused");
+    assert!(
+        matches!(err, GraphError::QueryError { .. }),
+        "expected a query error, got {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

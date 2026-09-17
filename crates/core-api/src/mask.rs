@@ -225,6 +225,27 @@ impl Scope {
     /// `roles.json` was corrupt at open — the same refusals
     /// [`GraphDb::mask_for_role`] makes, unchanged.
     pub fn resolve<F: Fs>(&self, db: &GraphDb<F>) -> Result<NodeMask> {
+        self.resolve_with(db, true)
+    }
+
+    /// Resolve against `db` without reading or writing the `keys` cache.
+    ///
+    /// The cache is keyed on `commit_seq`, which identifies a graph state only
+    /// within one handle. A store reopened from a snapshot seeds `commit_seq`
+    /// from `max(last_change)`, which underestimates the WAL length — so a
+    /// temporal handle from [`GraphDb::open_at`] can carry the same sequence as
+    /// the live one while holding a different graph. One `Scope` resolved
+    /// against both would then serve one's allow-list to the other, which is a
+    /// leak and not a staleness bug.
+    ///
+    /// Time-travel reads therefore resolve cold, in both directions: they do
+    /// not consult the entry and they do not leave one behind.
+    pub(crate) fn resolve_uncached<F: Fs>(&self, db: &GraphDb<F>) -> Result<NodeMask> {
+        self.resolve_with(db, false)
+    }
+
+    /// The body of [`Scope::resolve`] and [`Scope::resolve_uncached`].
+    fn resolve_with<F: Fs>(&self, db: &GraphDb<F>, cached: bool) -> Result<NodeMask> {
         let mut out: Option<NodeMask> = None;
         let mut narrow = |mask: NodeMask| {
             out = Some(match out.take() {
@@ -240,7 +261,7 @@ impl Scope {
             narrow(db.mask_for_namespace(namespace));
         }
         if self.keys.is_some() {
-            narrow(self.resolve_keys(db));
+            narrow(self.resolve_keys(db, cached));
         }
 
         // `new` refuses a legless scope, so at least one leg ran.
@@ -280,14 +301,19 @@ impl Scope {
     ///
     /// Callers check `self.keys.is_some()` first; an absent leg is not a leg
     /// resolving to the empty mask, which would hide everything.
-    fn resolve_keys<F: Fs>(&self, db: &GraphDb<F>) -> NodeMask {
+    ///
+    /// `cached = false` skips the memo entirely — see
+    /// [`Scope::resolve_uncached`] for why a temporal handle must.
+    fn resolve_keys<F: Fs>(&self, db: &GraphDb<F>, cached: bool) -> NodeMask {
         let keys = self.keys.as_deref().unwrap_or_default();
         let seq = db.commit_seq();
 
-        if let Ok(cache) = self.keys_cache.lock() {
-            if let Some((at, mask)) = cache.as_ref() {
-                if *at == seq {
-                    return mask.clone();
+        if cached {
+            if let Ok(cache) = self.keys_cache.lock() {
+                if let Some((at, mask)) = cache.as_ref() {
+                    if *at == seq {
+                        return mask.clone();
+                    }
                 }
             }
         }
@@ -296,8 +322,10 @@ impl Scope {
         SCOPE_KEYS_RESOLVES.with(|c| c.set(c.get() + 1));
         let mask = NodeMask::from_keys(db, keys.iter().map(String::as_str));
 
-        if let Ok(mut cache) = self.keys_cache.lock() {
-            *cache = Some((seq, mask.clone()));
+        if cached {
+            if let Ok(mut cache) = self.keys_cache.lock() {
+                *cache = Some((seq, mask.clone()));
+            }
         }
         mask
     }
@@ -512,6 +540,42 @@ mod tests {
             SCOPE_KEYS_RESOLVES.with(|c| c.get()) - before,
             2,
             "a write invalidates the cached key leg"
+        );
+    }
+
+    /// A time-travel read resolves cold, and leaves the cache as it found it.
+    ///
+    /// The cache is keyed on `commit_seq`, which identifies a graph state only
+    /// *within one handle*: a store reopened from a snapshot seeds its
+    /// `commit_seq` from `max(last_change)`, which underestimates the WAL
+    /// length (`db.rs`'s own note at the archive rename says so). So a
+    /// temporal handle from `open_at` can carry the same sequence as the live
+    /// one while holding a different graph — and a shared `Scope` would serve
+    /// one's allow-list to the other. `resolve_uncached` is the way out, and
+    /// it has to be cold in both directions to work.
+    #[test]
+    fn scope_resolve_uncached_neither_reads_nor_fills_the_cache() {
+        let dir = tmp_dir("scope-uncached");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Doc", "a", vec![]).unwrap();
+
+        let scope = Scope::new(None, None, Some(vec!["a".into()])).unwrap();
+        let before = SCOPE_KEYS_RESOLVES.with(|c| c.get());
+
+        scope.resolve_uncached(&db).unwrap();
+        scope.resolve_uncached(&db).unwrap();
+        assert_eq!(
+            SCOPE_KEYS_RESOLVES.with(|c| c.get()) - before,
+            2,
+            "an uncached resolve never serves the cached entry"
+        );
+
+        scope.resolve(&db).unwrap();
+        scope.resolve(&db).unwrap();
+        assert_eq!(
+            SCOPE_KEYS_RESOLVES.with(|c| c.get()) - before,
+            3,
+            "and never fills it either: the first cached resolve still rebuilds"
         );
     }
 

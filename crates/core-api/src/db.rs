@@ -183,9 +183,9 @@ impl ExactnessCaller {
             // Names the call that does take the argument, because this one
             // does not: the caller's own next step, not a parameter hunt.
             Self::Hybrid => {
-                "search_hybrid takes no exactness argument — run the vector leg on its \
-                 own with find_similar(field, vector, mask=…, exact=True) and fuse it \
-                 with search() yourself."
+                "run the vector leg on its own with find_similar(field, vector, mask=…, \
+                 exact=True) and fuse it with search() yourself — search_hybrid itself \
+                 takes no exactness argument."
             }
         }
     }

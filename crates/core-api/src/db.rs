@@ -1478,6 +1478,15 @@ pub struct GraphDb<F: Fs> {
     /// definitions change or the store is reloaded, which `commit_seq` does not
     /// record; see [`RoleMaskCache`](crate::mask::RoleMaskCache).
     role_masks: Arc<crate::mask::RoleMaskCache>,
+    /// Which loaded store this handle is, for memos that outlive it.
+    ///
+    /// `role_masks` needs no such thing — the handle owns it and replaces it —
+    /// but a [`Scope`](crate::mask::Scope) is the caller's, so its resolved key
+    /// leg is stamped with this alongside `commit_seq`. Minted fresh here and
+    /// again in [`reset_for_reload`](GraphDb::reset_for_reload), at exactly the
+    /// two points a fresh `RoleMaskCache` is installed; see
+    /// [`StoreStamp`](crate::mask::StoreStamp) for the invariant.
+    store_id: crate::mask::StoreId,
     /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
     /// distribute_events call.
     subscriptions: Vec<SubEntry>,
@@ -2040,9 +2049,10 @@ impl GraphDb<RealFs> {
     /// `roles.json` is a sidecar with no past version — the same split
     /// [`GraphDb::query_at_scoped`] documents.
     ///
-    /// The scope resolves **cold** here: its key memo is keyed on `commit_seq`,
-    /// which is a per-handle number, so filling it from a temporal handle could
-    /// hand that allow-list back to a live read. See
+    /// The scope resolves **cold** here: a temporal handle is its own store, so
+    /// its ids could never be served to a live read, but filling the scope's
+    /// one-entry key memo from a handle thrown away at the end of this call
+    /// would evict the live entry for nothing. See
     /// [`Scope::resolve_uncached`](crate::mask::Scope::resolve_uncached).
     ///
     /// # Errors
@@ -2148,6 +2158,7 @@ impl<F: Fs> GraphDb<F> {
             commit_seq: 0,
             roles: Some(vec![]),
             role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
+            store_id: crate::mask::StoreId::next(),
             subscriptions: Vec::new(),
             query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -2212,6 +2223,12 @@ impl<F: Fs> GraphDb<F> {
         // the old `Arc` keeps it to itself, so nothing it memoised against the
         // pre-reload store can be read back through this handle.
         self.role_masks = Arc::new(crate::mask::RoleMaskCache::new());
+        // The same move for memos this handle does not own. `commit_seq` is
+        // zeroed just above and reseeded from `max(last_change)`, which a
+        // delete-only commit leaves where it was — so a reload can land back on
+        // a sequence a caller's `Scope` already cached a mask at. A new id is
+        // what makes that entry stop matching.
+        self.store_id = crate::mask::StoreId::next();
         self.total_wal_commits = 0;
         self.base = None;
         self.fold_overlay = None;
@@ -10773,6 +10790,17 @@ impl<F: Fs> GraphDb<F> {
     pub fn last_changed(&self, key: &str) -> Option<u64> {
         let id = self.ids.get(key)?;
         self.last_change.get(&id).copied()
+    }
+
+    /// Which loaded store this handle is.
+    ///
+    /// Paired with [`commit_seq`](GraphDb::commit_seq) it identifies a graph
+    /// state outright, which `commit_seq` alone does not: two stores of the same
+    /// age share a sequence, and a reload can return to one. Memos of dense
+    /// node ids that the handle does not own are stamped with both; see
+    /// [`StoreStamp`](crate::mask::StoreStamp).
+    pub(crate) fn store_id(&self) -> crate::mask::StoreId {
+        self.store_id
     }
 
     /// The current commit sequence (number of successful commits since open,

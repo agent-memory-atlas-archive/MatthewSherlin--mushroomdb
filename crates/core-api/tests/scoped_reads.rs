@@ -12,7 +12,10 @@
 //! serve full-token client masks, where the caller already knows the key
 //! exists. That difference is the whole reason these methods exist.
 
-use core_api::{AlgoDir, Dir, GraphDb, GraphError, NodeMask, Predicate, RealFs, RuleDef, Value};
+use core_api::{
+    with_pairwise_caps, AlgoDir, Dir, GraphDb, GraphError, NodeMask, Predicate, RealFs, RuleDef,
+    Value,
+};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -347,4 +350,305 @@ fn scoped_explain_omits_a_path_through_a_hidden_node() {
         Err(GraphError::KeyNotFound { key }) => assert_eq!(key, "never-existed"),
         other => panic!("expected KeyNotFound, got {other:?}"),
     }
+}
+
+// ── pairwise_similar, search_hybrid (§5.3, §5.4) ─────────────────────────────
+
+fn emb(xs: &[f64]) -> Value {
+    Value::List(xs.iter().copied().map(Value::Float).collect())
+}
+
+/// Four keys with embeddings, one of which the scope hides — and the hidden one
+/// is `a`'s nearest neighbour, so a `k = 1` answer has room for exactly one of
+/// `hidden` and `b`.
+fn pairwise_fixture(name: &str) -> (std::path::PathBuf, GraphDb<RealFs>) {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (key, v) in [
+        ("a", [1.0, 0.0]),
+        ("hidden", [1.0, 0.01]),
+        ("b", [0.9, 0.436]),
+        ("c", [0.0, 1.0]),
+    ] {
+        db.insert_node("Item", key, vec![("emb".into(), emb(&v))])
+            .unwrap();
+    }
+    (dir, db)
+}
+
+/// A hidden vector packed into the matmul is a row every visible key is scored
+/// against. It can take a visible neighbour's place in the top-`k`, and — because
+/// the packed dimension is decided by a majority vote over the candidate rows —
+/// it can decide whether a visible pair is scored **at all**. Filtering the
+/// results afterwards leaves both effects standing.
+///
+/// The oracle is `pairwise_similar` over the visible keys alone: a scoped answer
+/// that differs from it, in any row or any score, has let a hidden vector speak.
+#[test]
+fn scoped_pairwise_drops_hidden_keys_before_the_matmul() {
+    let (_dir, db) = pairwise_fixture("pairwise-before-matmul");
+    let all = ["a", "hidden", "b", "c"];
+    let mask = NodeMask::from_keys(&db, ["a", "b", "c"]);
+
+    // The fixture really does put `hidden` at the top of `a`'s list, so a
+    // post-filter would have nothing left to report for `a`.
+    let unscoped = db.pairwise_similar(&all, "emb", 1, 0.0).unwrap();
+    let a_row = unscoped.iter().find(|(k, _)| k == "a").expect("`a` row");
+    assert_eq!(
+        a_row.1.first().map(|(k, _)| k.as_str()),
+        Some("hidden"),
+        "fixture must rank `hidden` first for `a`: {a_row:?}"
+    );
+
+    let got = db
+        .pairwise_similar_scoped(&all, "emb", 1, 0.0, &mask)
+        .unwrap();
+
+    // Identical to the same call over the visible subset — the whole contract.
+    let oracle = db
+        .pairwise_similar(&["a", "b", "c"], "emb", 1, 0.0)
+        .unwrap();
+    assert_eq!(
+        got, oracle,
+        "a scope must read as a smaller key set, nothing more"
+    );
+
+    // Said again as names, so a regression reads as a leak and not as a diff.
+    for (src, neigh) in &got {
+        assert_ne!(src, "hidden", "a hidden key must not be a subject");
+        for (dst, _) in neigh {
+            assert_ne!(dst, "hidden", "a hidden key must not be a neighbour");
+        }
+    }
+    let a_row = got.iter().find(|(k, _)| k == "a").expect("`a` row");
+    assert_eq!(
+        a_row.1.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["b"],
+        "`b` takes the place `hidden` held; post-filtering would leave `a` empty"
+    );
+}
+
+/// The dimension vote is the sharpest form of the same leak: `pairwise_similar`
+/// packs at the modal dimension of its candidate rows and silently omits every
+/// row of another width. Three hidden 2-d vectors outvote two visible 3-d ones,
+/// so unscoped the two visible keys are not scored at all — a hidden vector
+/// deciding a visible pair's score by deciding there isn't one.
+#[test]
+fn scoped_pairwise_hidden_vectors_do_not_carry_the_dimension_vote() {
+    let dir = tmp("pairwise-dim-vote");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Item", "p", vec![("emb".into(), emb(&[1.0, 0.0, 0.0]))])
+        .unwrap();
+    db.insert_node("Item", "q", vec![("emb".into(), emb(&[0.8, 0.6, 0.0]))])
+        .unwrap();
+    for (key, v) in [("h1", [1.0, 0.0]), ("h2", [0.0, 1.0]), ("h3", [0.6, 0.8])] {
+        db.insert_node("Item", key, vec![("emb".into(), emb(&v))])
+            .unwrap();
+    }
+    let all = ["p", "q", "h1", "h2", "h3"];
+    let mask = NodeMask::from_keys(&db, ["p", "q"]);
+
+    // Unscoped, the 2-d majority wins the vote and the visible pair vanishes.
+    let unscoped = db.pairwise_similar(&all, "emb", 5, 0.0).unwrap();
+    let srcs: Vec<&str> = unscoped.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        !srcs.contains(&"p") && !srcs.contains(&"q"),
+        "fixture must let the hidden dimension win unscoped: {srcs:?}"
+    );
+
+    let got = db
+        .pairwise_similar_scoped(&all, "emb", 5, 0.0, &mask)
+        .unwrap();
+    assert_eq!(
+        got,
+        db.pairwise_similar(&["p", "q"], "emb", 5, 0.0).unwrap(),
+        "the scoped answer is the visible subset's answer"
+    );
+    let p_row = got.iter().find(|(k, _)| k == "p").expect("`p` row");
+    assert_eq!(
+        p_row.1.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["q"],
+        "`p` and `q` are scored once the hidden rows cannot outvote them"
+    );
+}
+
+/// The caps count the keys that actually reach the kernel, so the scope is
+/// allowed to bring an over-cap call under the cap. That is a feature: the work
+/// the cap exists to refuse is work this call no longer does.
+#[test]
+fn scoped_pairwise_caps_measure_the_filtered_set() {
+    let dir = tmp("pairwise-caps");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let keys = ["a", "b", "c", "d", "e"];
+    for (i, key) in keys.iter().enumerate() {
+        let t = i as f64 * 0.1;
+        db.insert_node("Item", key, vec![("emb".into(), emb(&[1.0 - t, t]))])
+            .unwrap();
+    }
+    let mask = NodeMask::from_keys(&db, ["a", "b", "c"]);
+
+    // PAIRWISE_MAX_N = 3: five keys is over, the three visible ones are not.
+    with_pairwise_caps(2, 3, || {
+        match db.pairwise_similar(&keys, "emb", 5, 0.0) {
+            Err(GraphError::QueryError { detail }) => {
+                assert!(
+                    detail.contains("PAIRWISE_MAX_N") && detail.contains("n=5"),
+                    "unscoped must refuse the full key set: {detail}"
+                );
+            }
+            other => panic!("expected the cap QueryError, got {other:?}"),
+        }
+        let got = db
+            .pairwise_similar_scoped(&keys, "emb", 5, 0.0, &mask)
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"],
+            "the post-filter count is under the cap, so the call succeeds"
+        );
+    });
+
+    // And the cap still bites on the filtered count when *that* is over it —
+    // the scope moves the measurement, it does not remove it.
+    with_pairwise_caps(2, 2, || {
+        match db.pairwise_similar_scoped(&keys, "emb", 5, 0.0, &mask) {
+            Err(GraphError::QueryError { detail }) => assert!(
+                detail.contains("n=3"),
+                "the refusal must name the post-filter count, not 5: {detail}"
+            ),
+            other => panic!("expected the cap QueryError, got {other:?}"),
+        }
+    });
+}
+
+/// Eight hidden nodes outrank the two visible ones in **both** legs, and the
+/// over-fetch is `4*k = 8`. Fuse first and the pool is spent entirely on hidden
+/// hits, so filtering the fused list returns nothing; filter first and the `8`
+/// is a budget of visible hits, so `k = 2` is honoured.
+#[test]
+fn scoped_hybrid_filters_before_fusion() {
+    let dir = tmp("hybrid-before-fusion");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.enable_fulltext("Item", "body").unwrap();
+    // `h*` sorts before `v*`, and every node matches the text query and the
+    // query vector identically, so the key tiebreak decides both rankings.
+    let mut all: Vec<String> = (0..8).map(|i| format!("h{i}")).collect();
+    all.extend((0..2).map(|i| format!("v{i}")));
+    for key in &all {
+        db.insert_node(
+            "Item",
+            key,
+            vec![
+                ("body".into(), Value::Str("unique".into())),
+                ("emb".into(), emb(&[1.0, 0.0])),
+            ],
+        )
+        .unwrap();
+    }
+    let mask = NodeMask::from_keys(&db, ["v0", "v1"]);
+    let q = [1.0_f64, 0.0];
+
+    // Unscoped, the visible pair is nowhere near the top — that is the fixture.
+    let unscoped = db.search_hybrid("body", "unique", "emb", &q, Some("Item"), 2);
+    assert_eq!(
+        unscoped.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["h0", "h1"],
+        "fixture must bury the visible nodes under the over-fetch"
+    );
+
+    let got = db.search_hybrid_scoped("body", "unique", "emb", &q, Some("Item"), 2, &mask);
+    assert_eq!(
+        got.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["v0", "v1"],
+        "k=2 visible candidates exist, so k=2 must come back"
+    );
+
+    // Both legs really did contribute, and both ranked `v0` first: the ranks
+    // that enter RRF are the visible corpus's ranks, not `v0`'s store-wide rank
+    // of 9. One leg alone would score 1/61; two score 2/61, at the unchanged
+    // constant 60.
+    assert!(
+        (got[0].1 - 2.0 / 61.0).abs() < 1e-12,
+        "both legs must fuse `v0` at visible rank 1: {got:?}"
+    );
+    assert!(
+        (got[1].1 - 2.0 / 62.0).abs() < 1e-12,
+        "and `v1` at visible rank 2: {got:?}"
+    );
+}
+
+/// `mask=` alone rides the widening beam. That is deliberate — making a mask
+/// imply `exact` would turn every existing masked caller's ANN into an O(n)
+/// GEMM — but it cost a real integration team real time, because nothing said
+/// so. The line is printed once per index, the way the dimension-mismatch skip
+/// in `core_rules::hnsw` is.
+#[test]
+fn a_masked_search_without_exact_warns_once() {
+    let dir = tmp("exactness-warning");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for i in 0..8u32 {
+        let x = 0.5 + i as f64 * 0.05;
+        db.insert_node(
+            "V",
+            &format!("v{i}"),
+            vec![("emb".into(), emb(&[x, 1.0 - x]))],
+        )
+        .unwrap();
+    }
+    db.create_rule(RuleDef {
+        name: "ann".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 1.0,
+        },
+        edge_type: "SIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    })
+    .unwrap();
+    assert!(db.has_vector_rule("emb"), "an index must cover the field");
+
+    let visible: Vec<String> = (0..6).map(|i| format!("v{i}")).collect();
+    let mask = NodeMask::from_keys(&db, visible.iter().map(String::as_str));
+    let q = [1.0_f64, 0.0];
+
+    core_api::ambiguous_exactness_warns_reset();
+
+    // An unmasked search is unambiguous: approximate is what it has always been.
+    db.find_similar_vector("emb", Some("V"), &q, 3, 0.0);
+    assert_eq!(
+        core_api::ambiguous_exactness_warns(),
+        0,
+        "only a masked call is ambiguous"
+    );
+
+    // `exact=True` and a `where=` predicate both say which kernel they want.
+    db.find_similar_vector_filtered("emb", Some("V"), &q, 3, 0.0, Some(&mask), None, true)
+        .unwrap();
+    assert_eq!(
+        core_api::ambiguous_exactness_warns(),
+        0,
+        "`exact=True` already names the choice"
+    );
+
+    db.find_similar_vector_masked("emb", Some("V"), &q, 3, 0.0, &mask);
+    assert_eq!(
+        core_api::ambiguous_exactness_warns(),
+        1,
+        "a masked, non-exact search over an indexed field explains itself"
+    );
+
+    db.find_similar_vector_masked("emb", Some("V"), &q, 3, 0.0, &mask);
+    assert_eq!(
+        core_api::ambiguous_exactness_warns(),
+        1,
+        "once per index — a per-call line would be noise a caller learns to skip"
+    );
 }

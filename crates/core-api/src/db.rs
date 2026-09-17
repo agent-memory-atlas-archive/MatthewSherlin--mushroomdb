@@ -101,6 +101,30 @@ pub fn reset_query_sub_exec_count() {
     QUERY_SUB_EXECS_TL.with(|c| c.set(0));
 }
 
+// Exact-versus-approximate warnings emitted on this thread. Thread-local for
+// the same reason [`QUERY_SUB_EXECS_TL`] is: integration tests run in parallel
+// and each gets its own thread, so a neighbour's masked search cannot be
+// mistaken for this test's.
+thread_local! {
+    static AMBIGUOUS_EXACTNESS_WARNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times a masked, non-exact vector search has explained itself on
+/// this thread since the last [`ambiguous_exactness_warns_reset`].
+///
+/// The line itself is the product; this counter exists so a test can assert it
+/// is printed **once per index** rather than once per call.
+#[doc(hidden)]
+pub fn ambiguous_exactness_warns() -> u64 {
+    AMBIGUOUS_EXACTNESS_WARNS.with(|c| c.get())
+}
+
+/// Reset this thread's exactness-warning counter to zero.
+#[doc(hidden)]
+pub fn ambiguous_exactness_warns_reset() {
+    AMBIGUOUS_EXACTNESS_WARNS.with(|c| c.set(0));
+}
+
 /// Internal state for a single `subscribe_query` subscription.
 ///
 /// On every commit, `distribute_events` re-executes `ops` against the current
@@ -1543,6 +1567,12 @@ pub struct GraphDb<F: Fs> {
     /// Ring buffer of recent slow queries (interior-mutable so `query(&self)`
     /// can record entries without requiring `&mut self`).
     slow_queries: std::sync::Mutex<SlowQueryLog>,
+    /// `(field, label)` pairs whose exact-versus-approximate ambiguity this
+    /// handle has already explained once. See
+    /// [`note_ambiguous_exactness`](GraphDb::note_ambiguous_exactness).
+    /// Advice bookkeeping, not graph state: a reload keeps it, as the
+    /// slow-query log does.
+    warned_ambiguous_exactness: std::sync::Mutex<HashSet<(String, String)>>,
     /// Instant at which the database was opened (used by `/metrics` uptime).
     started_at: std::time::Instant,
     // ── Multi-process state (cross-process lock + WAL tailing) ────────────────
@@ -2107,6 +2137,7 @@ impl<F: Fs> GraphDb<F> {
                 entries: std::collections::VecDeque::new(),
                 total: 0,
             }),
+            warned_ambiguous_exactness: std::sync::Mutex::new(HashSet::new()),
             started_at: std::time::Instant::now(),
             wal_consumed: 0,
             snapshot_ident: None,
@@ -6561,6 +6592,67 @@ impl<F: Fs> GraphDb<F> {
         label: Option<&str>,
         k: usize,
     ) -> Vec<(String, f64)> {
+        self.search_hybrid_inner(
+            text_field,
+            query_text,
+            vector_field,
+            query_vec,
+            label,
+            k,
+            None,
+        )
+    }
+
+    /// [`search_hybrid`](Self::search_hybrid) with **each leg** filtered to the
+    /// mask before the fusion.
+    ///
+    /// Filtering the fused list afterwards would quietly return fewer than `k`.
+    /// Each leg over-fetches `4*k` candidates, so when the visible nodes rank
+    /// below `4*k` hidden ones neither leg carries them into the fusion at all
+    /// and the post-filter has nothing left to keep. Filtering first spends the
+    /// `4*k` on **visible** hits, so a scoped call is as long as the corpus it
+    /// can see allows.
+    ///
+    /// The ranks that enter RRF are therefore the ranks of the visible corpus,
+    /// not the visible entries of the store-wide ranking. The constant stays 60
+    /// and the tiebreak stays key-ascending.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_hybrid_scoped(
+        &self,
+        text_field: &str,
+        query_text: &str,
+        vector_field: &str,
+        query_vec: &[f64],
+        label: Option<&str>,
+        k: usize,
+        mask: &crate::mask::NodeMask,
+    ) -> Vec<(String, f64)> {
+        self.search_hybrid_inner(
+            text_field,
+            query_text,
+            vector_field,
+            query_vec,
+            label,
+            k,
+            Some(mask),
+        )
+    }
+
+    /// The body shared by [`search_hybrid`](Self::search_hybrid) and
+    /// [`search_hybrid_scoped`](Self::search_hybrid_scoped). `mask = None` is
+    /// the unscoped contract unchanged: the filter below is then a no-op and
+    /// the vector leg is the same unmasked call it has always been.
+    #[allow(clippy::too_many_arguments)]
+    fn search_hybrid_inner(
+        &self,
+        text_field: &str,
+        query_text: &str,
+        vector_field: &str,
+        query_vec: &[f64],
+        label: Option<&str>,
+        k: usize,
+        mask: Option<&crate::mask::NodeMask>,
+    ) -> Vec<(String, f64)> {
         use std::collections::HashMap;
 
         const RRF_K: f64 = 60.0;
@@ -6569,16 +6661,27 @@ impl<F: Fs> GraphDb<F> {
         // Accumulate per-node RRF scores.
         let mut scores: HashMap<String, f64> = HashMap::new();
 
-        // Text leg.
+        // Text leg. The mask bites on the candidates, before `take(pool)`, so
+        // the over-fetch is a budget of visible hits rather than one a hidden
+        // prefix can exhaust.
         let text_hits = self.search(text_field, query_text);
-        for (rank0, (key, _count)) in text_hits.into_iter().take(pool).enumerate() {
+        let visible_text = text_hits
+            .into_iter()
+            .filter(|(key, _count)| mask.is_none_or(|m| m.contains_node(self, key)));
+        for (rank0, (key, _count)) in visible_text.take(pool).enumerate() {
             let rank = (rank0 + 1) as f64;
             *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
         }
 
-        // Vector leg (skipped when query_vec is empty).
+        // Vector leg (skipped when query_vec is empty). The masked variant
+        // applies the mask before its own k-truncation, for the same reason.
         if !query_vec.is_empty() {
-            let vec_hits = self.find_similar_vector(vector_field, label, query_vec, pool, 0.0);
+            let vec_hits = match mask {
+                Some(m) => {
+                    self.find_similar_vector_masked(vector_field, label, query_vec, pool, 0.0, m)
+                }
+                None => self.find_similar_vector(vector_field, label, query_vec, pool, 0.0),
+            };
             for (rank0, (key, _sim)) in vec_hits.into_iter().enumerate() {
                 let rank = (rank0 + 1) as f64;
                 *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
@@ -8888,6 +8991,9 @@ impl<F: Fs> GraphDb<F> {
             None => self.engine.hnsw_any_dst_len(field, q_unit.len()),
         };
         let n = index_len?;
+        // The `?` above is the coverage test: past it, an index exists and this
+        // masked, non-exact call is about to ride it.
+        self.note_ambiguous_exactness(field, label);
         // Same ceiling the exact-rule widening loop in `hnsw_candidates`
         // consults — including the `with_ef_max` test hook.
         let cap = ef_max();
@@ -8923,6 +9029,46 @@ impl<F: Fs> GraphDb<F> {
             }
             ef = ef.saturating_mul(2);
         }
+    }
+
+    /// Say once, per `(field, label)` index, that a masked search is answering
+    /// approximately.
+    ///
+    /// A mask narrows *which nodes may be returned*. It does not choose a
+    /// kernel — `exact=true` and a `where=` predicate do, and nothing else
+    /// does. A caller who needed exact answers, passed `mask=` alone, and read
+    /// the mask as a promise of exhaustiveness gets a correct-looking
+    /// approximate answer and no signal at all; that is a silent wrong answer,
+    /// and it has cost an integration team real time.
+    ///
+    /// The fix is a question, not a behaviour change. Making a mask imply
+    /// `exact` would turn every existing masked caller's ANN into an O(n) GEMM
+    /// without asking them, which is a worse trade than the ambiguity.
+    ///
+    /// Printed once per index for the reason the dimension-mismatch skip in
+    /// `core_rules::hnsw` is: a line on every call is a line callers learn to
+    /// scroll past.
+    fn note_ambiguous_exactness(&self, field: &str, label: Option<&str>) {
+        let entry = (field.to_string(), label.unwrap_or("").to_string());
+        let first = match self.warned_ambiguous_exactness.lock() {
+            Ok(mut seen) => seen.insert(entry),
+            Err(poisoned) => poisoned.into_inner().insert(entry),
+        };
+        if !first {
+            return;
+        }
+        AMBIGUOUS_EXACTNESS_WARNS.with(|c| c.set(c.get().saturating_add(1)));
+        let which = match label {
+            Some(lbl) => format!(" (label `{lbl}`)"),
+            None => String::new(),
+        };
+        eprintln!(
+            "mushroomdb: a masked vector search on field `{field}`{which} is answering \
+             approximately. A mask narrows which nodes may be returned; it does not \
+             change which kernel runs, and an index covers this field. For an exact \
+             answer over the same visible candidate set, pass exact=True or a where= \
+             predicate. Further masked searches on this index are silent."
+        );
     }
 
     /// `label ∩ mask ∩ holds(where)`. Index fast path when `label` is `Some`
@@ -9110,6 +9256,38 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         Ok(out)
+    }
+
+    /// [`pairwise_similar`](Self::pairwise_similar) over the keys the mask
+    /// admits — intersected **before** the matmul, never filtered after it.
+    ///
+    /// A hidden vector packed into the Gram is a row every visible key is
+    /// scored against. It can take a visible neighbour's place in the top-`k`,
+    /// and because the packed dimension is a majority vote over the candidate
+    /// rows it can decide whether a visible pair is scored at all. Dropping
+    /// hidden names from the finished answer leaves both effects standing, so
+    /// the intersection happens first and the answer is byte-for-byte the one
+    /// `pairwise_similar` gives for the visible keys alone.
+    ///
+    /// The caps therefore measure the **post-filter** count: a key set over
+    /// [`PAIRWISE_MAX_N`](crate::PAIRWISE_MAX_N) unscoped can come under it
+    /// scoped and succeed, because the work the cap refuses is work this call
+    /// no longer does. A filtered count still over the cap is still refused.
+    #[allow(clippy::type_complexity)]
+    pub fn pairwise_similar_scoped(
+        &self,
+        keys: &[&str],
+        field: &str,
+        k: usize,
+        min: f64,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<(String, Vec<(String, f64)>)>> {
+        let visible: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| mask.contains_node(self, key))
+            .collect();
+        self.pairwise_similar(&visible, field, k, min)
     }
 
     /// Neighbours of packed row `i`: drop self, keep `score >= min`, sort

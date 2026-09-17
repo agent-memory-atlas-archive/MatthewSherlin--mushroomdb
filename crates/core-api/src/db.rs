@@ -10391,6 +10391,11 @@ impl<F: Fs> GraphDb<F> {
     /// The explanation is therefore kept only when at least one **visible** via
     /// node satisfies the rule on its own.
     ///
+    /// The weight is the **visible corpus's** number, not the store's: a via-hop
+    /// rule stores the max over every via it hopped through, so the stored value
+    /// can be a score only a hidden via produced. It is recomputed over the
+    /// visible vias alone.
+    ///
     /// Hidden or unknown `key_a` or `key_b` → [`GraphError::KeyNotFound`].
     pub fn explain_scoped(
         &self,
@@ -10406,39 +10411,49 @@ impl<F: Fs> GraphDb<F> {
         Ok(self
             .explain(key_a, key_b)?
             .into_iter()
-            .filter(|e| self.explanation_evidence_is_visible(e, mask))
+            .filter_map(|e| self.scoped_explanation(e, mask))
             .collect())
     }
 
-    /// Whether `e` stands for a caller limited to `mask`.
+    /// `e` as a caller limited to `mask` may have it, or `None` when it must be
+    /// dropped entirely.
     ///
-    /// True for every non-via-hop explanation: its only nodes are the two
-    /// subjects, which [`explain_scoped`](Self::explain_scoped) has already
-    /// checked. For a via-hop rule, true when some via node the mask admits
-    /// satisfies the rule's predicate against the destination — the same walk
-    /// the rule engine makes, narrowed to the visible hops.
-    fn explanation_evidence_is_visible(
+    /// Every non-via-hop explanation passes through untouched: its only nodes
+    /// are the two subjects, which [`explain_scoped`](Self::explain_scoped) has
+    /// already checked, and its weight is scored over that pair alone.
+    ///
+    /// A via-hop explanation is kept only when some via node the caller may see
+    /// satisfies the rule on its own — and then its weight is recomputed as the
+    /// max over exactly those vias. The engine writes the max over **all** of
+    /// them (`core-rules::engine`, `best = prev.max(score)`), so passing the
+    /// stored number through would let a hidden node set a figure the caller
+    /// reads: the same disclosure dropping the explanation exists to prevent.
+    ///
+    /// A rule that stores no weight still reports none. The recomputed score is
+    /// a sanitised version of a number `explain` already returned, never a new
+    /// one — a scoped read must not say more than the unscoped read it narrows.
+    fn scoped_explanation(
         &self,
-        e: &Explanation,
+        e: Explanation,
         mask: &crate::mask::NodeMask,
-    ) -> bool {
-        let Some(via_edge) = e.via_edge.as_deref() else {
-            return true;
+    ) -> Option<Explanation> {
+        let Some(via_edge) = e.via_edge.clone() else {
+            return Some(e);
         };
         let Some(rule_def) = self.engine.rules().find(|r| r.name == e.rule) else {
             // The rule is gone but its provenance is not; nothing can vouch for
             // the hop, so nothing is shown.
-            return false;
+            return None;
         };
         let Some(via_label) = rule_def.via_label.as_deref() else {
-            return true;
+            return Some(e);
         };
         let (Some(src), Some(dst)) = (self.ids.get(&e.src_key), self.ids.get(&e.dst_key)) else {
-            return false;
+            return None;
         };
-        let (Some(via_etype), Some(via_sym)) = (self.syms.get(via_edge), self.syms.get(via_label))
+        let (Some(via_etype), Some(via_sym)) = (self.syms.get(&via_edge), self.syms.get(via_label))
         else {
-            return false;
+            return None;
         };
         let via_dir = rule_def.via_dir.unwrap_or(Direction::Out);
         let props_view = build_props_view(&self.props, &self.base);
@@ -10447,27 +10462,49 @@ impl<F: Fs> GraphDb<F> {
             key: &e.dst_key,
             props: &dst_get,
         };
-        self.topo_view()
+        // The rule's own namespace test, the one the engine applies to each via
+        // candidate (`core-rules::engine::rule_sees_node`). Without it a
+        // visible, out-of-namespace via — right label, satisfying predicate —
+        // vouches for a hop the engine never made, and an explanation whose real
+        // evidence is a hidden in-namespace node is kept.
+        let rule_sees = |id: u32| match rule_def.namespace.as_deref() {
+            None => true,
+            Some(ns) => {
+                let value = props_view.get(id, NS_PROP).map(|vr| vr.into_value());
+                namespace_of_value(value.as_ref()) == ns
+            }
+        };
+        let best = self
+            .topo_view()
             .neighbors(via_etype, via_dir, src)
             .iter()
             .copied()
-            .any(|via| {
+            .filter_map(|via| {
                 if !mask.contains_id(via) {
-                    return false;
+                    return None;
                 }
                 if self.labels.get(via as usize).copied() != Some(via_sym) {
-                    return false;
+                    return None;
                 }
-                let Some(via_key) = self.ids.key_of(via) else {
-                    return false;
-                };
+                if !rule_sees(via) {
+                    return None;
+                }
+                let via_key = self.ids.key_of(via)?;
                 let via_get = |field: &str| props_view.get(via, field).map(|vr| vr.into_value());
                 let via_view = NodeView {
                     key: via_key,
                     props: &via_get,
                 };
-                evaluate(&rule_def.predicate, &via_view, &dst_view).is_some()
+                evaluate(&rule_def.predicate, &via_view, &dst_view)
             })
+            .fold(None::<f64>, |best, score| {
+                Some(match best {
+                    None => score,
+                    Some(prev) => prev.max(score),
+                })
+            })?;
+        let weight = e.weight.map(|_| best);
+        Some(Explanation { weight, ..e })
     }
 
     pub fn neighbors(&self, key: &str, edge_type: &str, dir: Direction) -> Result<Vec<String>> {

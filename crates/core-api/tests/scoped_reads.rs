@@ -13,8 +13,8 @@
 //! exists. That difference is the whole reason these methods exist.
 
 use core_api::{
-    with_pairwise_caps, AlgoDir, Dir, GraphDb, GraphError, NodeMask, Predicate, RealFs, RuleDef,
-    Value,
+    with_pairwise_caps, AlgoDir, Dir, Explanation, GraphDb, GraphError, NodeMask, Predicate,
+    RealFs, RuleDef, Value, NS_PROP,
 };
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -87,6 +87,134 @@ fn via(name: &str) -> (std::path::PathBuf, GraphDb<RealFs>) {
         via_edge: Some("WORKS_AT".into()),
         via_dir: None,
         namespace: None,
+    })
+    .unwrap();
+    (dir, db)
+}
+
+/// The `via` fixture with the two things it deliberately left out: a
+/// `weight_prop`, and two via nodes that score **differently**.
+///
+/// `alice` works at both orgs. The rule scores `NumericWithin` between the via
+/// and `proj_a`, whose `rank` is `0.0`, with a tolerance of `1.0` — so the score
+/// is `1.0 - rank`, and the engine stores the **max over every via**:
+///
+/// | via | `rank` | score |
+/// |---|---|---|
+/// | `org_visible` | 0.5 | 0.5 |
+/// | `org_hidden` | 0.25 | **0.75** |
+///
+/// The stored weight is therefore `0.75`, a number only the hidden org
+/// produced. Both ranks are exact binary fractions, so the scores are exact and
+/// the assertions need no epsilon.
+///
+/// The predicate is `All([KeyMatch, NumericWithin])` rather than the bare
+/// `NumericWithin` so that it is **direction-sensitive**: `KeyMatch` reads
+/// `ref` from the *first* view and compares it to the *second* view's key, so
+/// evaluating `(dst, via)` instead of `(via, dst)` scores nothing at all. A
+/// symmetric predicate cannot tell those two apart, and the recomputation has
+/// to ask the question the engine asked. `KeyMatch` scores 1.0 and `All` takes
+/// the min, so the scores in the table above are unchanged.
+fn via_weighted(name: &str) -> (std::path::PathBuf, GraphDb<RealFs>) {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    let org = |v: f64| {
+        vec![
+            ("rank".to_string(), Value::Float(v)),
+            ("ref".to_string(), Value::Str("proj_a".into())),
+        ]
+    };
+    db.insert_node("Org", "org_visible", org(0.5)).unwrap();
+    db.insert_node("Org", "org_hidden", org(0.25)).unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    db.insert_node(
+        "Project",
+        "proj_a",
+        vec![("rank".into(), Value::Float(0.0))],
+    )
+    .unwrap();
+    db.insert_edge("WORKS_AT", "alice", "org_visible").unwrap();
+    db.insert_edge("WORKS_AT", "alice", "org_hidden").unwrap();
+    db.create_rule(RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Project".into(),
+        predicate: Predicate::All(vec![
+            Predicate::KeyMatch {
+                field: "ref".into(),
+            },
+            Predicate::NumericWithin {
+                field: "rank".into(),
+                tolerance: 1.0,
+            },
+        ]),
+        edge_type: "FIT".into(),
+        weight_prop: Some("score".into()),
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("WORKS_AT".into()),
+        via_dir: None,
+        namespace: None,
+    })
+    .unwrap();
+    (dir, db)
+}
+
+/// The `via` fixture with a **namespace** on the via-hop rule, and two vias that
+/// differ only in which namespace they sit in.
+///
+/// `org_hidden` is in `t1` and is the via the engine actually hopped through —
+/// `fit` is scoped to `t1`, so `org_visible` in `t2` was never a candidate.
+/// Both carry label `Org`, both satisfy the predicate, both are `WORKS_AT` from
+/// `alice`. The only difference is the namespace.
+///
+/// The hop edges are **derived**, by a global `employs` rule, because a
+/// user-written edge may not cross a namespace boundary
+/// (`GraphError::CrossNamespace`). A global rule sees every node, so its edges
+/// can — which is the chaining case [`Explanation::via_edge`] documents, and the
+/// only way a visible out-of-namespace via can sit on `alice`'s hop edge at all.
+fn via_namespaced(name: &str) -> (std::path::PathBuf, GraphDb<RealFs>) {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    let ns = |n: &str| (NS_PROP.to_string(), Value::Str(n.to_string()));
+    let tech = |n: &str| vec![("industry".to_string(), Value::Str("tech".into())), ns(n)];
+    db.insert_node("Org", "org_hidden", tech("t1")).unwrap();
+    db.insert_node("Org", "org_visible", tech("t2")).unwrap();
+    db.insert_node("Person", "alice", tech("t1")).unwrap();
+    db.insert_node("Project", "proj_a", tech("t1")).unwrap();
+    db.create_rule(RuleDef {
+        name: "employs".into(),
+        src_label: "Person".into(),
+        dst_label: "Org".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "WORKS_AT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    })
+    .unwrap();
+    db.create_rule(RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Project".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "FIT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("WORKS_AT".into()),
+        via_dir: None,
+        namespace: Some("t1".into()),
     })
     .unwrap();
     (dir, db)
@@ -350,6 +478,91 @@ fn scoped_explain_omits_a_path_through_a_hidden_node() {
         Err(GraphError::KeyNotFound { key }) => assert_eq!(key, "never-existed"),
         other => panic!("expected KeyNotFound, got {other:?}"),
     }
+}
+
+/// The weight a scoped explanation reports is the **visible corpus's** number.
+///
+/// A via-hop rule stores the max over every via node, so the stored weight can
+/// be a score only a hidden via produced. Passing it through unchanged is the
+/// same disclosure the dropped-explanation rule exists to prevent: a hidden node
+/// influencing a number the caller reads (defect #3).
+#[test]
+fn scoped_explain_reports_the_weight_of_the_visible_vias_only() {
+    let (_dir, db) = via_weighted("explain-weight-visible-only");
+
+    // Unscoped, the stored weight is the hidden org's 0.75 — the max over both.
+    let full = db.explain("alice", "proj_a").unwrap();
+    assert_eq!(full.len(), 1, "fixture must derive one edge: {full:?}");
+    assert_eq!(
+        full[0].weight,
+        Some(0.75),
+        "fixture must store the max over both vias"
+    );
+
+    // Hide the org that set that max. The explanation survives — `org_visible`
+    // vouches for it on its own — but the number must become `org_visible`'s.
+    let hides_top = NodeMask::from_keys(&db, ["alice", "proj_a", "org_visible"]);
+    let scoped = db.explain_scoped("alice", "proj_a", &hides_top).unwrap();
+    assert_eq!(scoped.len(), 1, "a visible via still vouches: {scoped:?}");
+    assert_eq!(
+        scoped[0].weight,
+        Some(0.5),
+        "the weight must be the visible corpus's max, not the hidden via's 0.75"
+    );
+    // Nothing else about the explanation changes.
+    assert_eq!(
+        Explanation {
+            weight: full[0].weight,
+            ..scoped[0].clone()
+        },
+        full[0],
+        "only the weight is rewritten"
+    );
+
+    // Show both vias and the stored number comes back.
+    let all = NodeMask::from_keys(&db, ["alice", "proj_a", "org_visible", "org_hidden"]);
+    assert_eq!(db.explain_scoped("alice", "proj_a", &all).unwrap(), full);
+
+    // Hide every via and the explanation goes entirely, weight and all.
+    let no_via = NodeMask::from_keys(&db, ["alice", "proj_a"]);
+    assert_eq!(
+        db.explain_scoped("alice", "proj_a", &no_via).unwrap(),
+        Vec::<Explanation>::new()
+    );
+}
+
+/// Only a via the **rule** could have hopped through may vouch for an
+/// explanation.
+///
+/// The engine filters via candidates by the rule's namespace, so a visible via
+/// in another namespace was never evidence for anything. Letting it vouch keeps
+/// an explanation whose real evidence is a hidden node — the leak, dressed as a
+/// visible witness (defect #4).
+#[test]
+fn scoped_explain_rejects_an_out_of_namespace_via_as_evidence() {
+    let (_dir, db) = via_namespaced("explain-out-of-namespace-via");
+
+    // The edge exists, and `org_hidden` (ns `t1`) is the only via that made it:
+    // the rule is scoped to `t1`, so `org_visible` (ns `t2`) was never a hop.
+    let full = db.explain("alice", "proj_a").unwrap();
+    assert_eq!(full.len(), 1, "fixture must derive one edge: {full:?}");
+    assert_eq!(full[0].via_edge.as_deref(), Some("WORKS_AT"));
+
+    // `org_visible` is visible, carries `Org`, satisfies the predicate, and is
+    // `WORKS_AT` from `alice` — everything but the namespace. It must not vouch.
+    let hides_in_ns = NodeMask::from_keys(&db, ["alice", "proj_a", "org_visible"]);
+    assert_eq!(
+        db.explain_scoped("alice", "proj_a", &hides_in_ns).unwrap(),
+        Vec::<Explanation>::new(),
+        "an out-of-namespace via is not evidence the engine ever used"
+    );
+
+    // The in-namespace via, shown, does vouch.
+    let shows_in_ns = NodeMask::from_keys(&db, ["alice", "proj_a", "org_hidden"]);
+    assert_eq!(
+        db.explain_scoped("alice", "proj_a", &shows_in_ns).unwrap(),
+        full
+    );
 }
 
 // ── pairwise_similar, search_hybrid (§5.3, §5.4) ─────────────────────────────

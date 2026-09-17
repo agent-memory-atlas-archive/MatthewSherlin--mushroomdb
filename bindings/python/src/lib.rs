@@ -1,8 +1,8 @@
 use core_api::{
     default_max_edges, valid_namespace, AlgoDir, AsOfScope, Direction, EdgeAt, Explanation,
     GraphDb as CoreDb, GraphError, HistoryChange, HistoryEntry, MaskedNodeResult, NamespaceStats,
-    NodeInfo, NodeMask, PredicateSummary, PropPredicate, ResultSet, RuleDef, Scope, Value,
-    NS_MAX_LEN, NS_PROP,
+    NodeInfo, NodeMask, OnConflict, PredicateSummary, PropPredicate, ResultSet, RuleDef, Scope,
+    Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -1185,23 +1185,53 @@ impl GraphDb {
     /// A bad edge (unknown endpoint, rule-owned, …) rejects the **entire**
     /// batch — nothing is committed and `RuntimeError` is raised.
     ///
-    /// Returns a dict matching `IngestReport` shape:
-    /// `{inserted, edges_inserted, row_errors, rules_created, skipped_fk_fields}`.
-    /// `edges_inserted` counts only newly written edges; duplicate edges that
-    /// already exist are silent no-ops and are NOT counted.
+    /// `on_conflict` says what a node key that is already taken means, so a
+    /// mirror can be rebuilt onto a store that already has content:
+    ///
+    /// - `"error"` (default) — one duplicate key rejects the whole frame with
+    ///   `DuplicateKey`. The behaviour before 0.6.10, unchanged.
+    /// - `"skip"` — the stored node is left exactly as it is (properties,
+    ///   label and edges) and counted in `skipped`.
+    /// - `"replace"` — the key is kept and the node's properties become
+    ///   **exactly** the supplied props: supplied fields are set, fields
+    ///   absent from the supplied props are removed. Counted in `replaced`.
+    ///   A supplied label that differs from the stored one is a row error, not
+    ///   a silent relabel — relabelling is `rename_node`. So is a supplied
+    ///   `ns` that would move the node between namespaces, and an omitted `ns`
+    ///   on a node that is in one, since an absent `ns` names `default`.
+    ///
+    /// The frame stays atomic under every policy: skip and replace are decided
+    /// during the batch's own validate pass, so it still applies wholly or not
+    /// at all. Rows refused by `replace` change nothing and the rest commits.
+    ///
+    /// Edges take the argument too but it changes nothing for them: adjacency
+    /// is a set, so a duplicate edge is already a silent no-op under every
+    /// policy, and these edge dicts carry no properties to replace.
+    ///
+    /// Returns a dict matching `IngestReport` shape, plus the two conflict
+    /// counts: `{inserted, edges_inserted, skipped, replaced, row_errors,
+    /// rules_created, skipped_fk_fields}`. `row_errors` is a list of
+    /// `(index into nodes, why)`. `edges_inserted` counts only newly written
+    /// edges; duplicate edges that already exist are silent no-ops and are NOT
+    /// counted.
     ///
     /// **Performance note**: for large datasets keep each call to ≤10 000 nodes.
     /// A single call with 100 000+ nodes serialises one giant WAL frame whose
     /// fsync cost dominates and negates the batching benefit.  Chunk at the
     /// call site (e.g. `for chunk in batched(nodes, 10_000)`).
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (nodes, edges=None), text_signature = "($self, nodes, edges=None)")]
+    #[pyo3(
+        signature = (nodes, edges=None, on_conflict="error"),
+        text_signature = "($self, nodes, edges=None, on_conflict='error')"
+    )]
     fn ingest_batch(
         &self,
         py: Python<'_>,
         nodes: Bound<'_, PyList>,
         edges: Option<Bound<'_, PyList>>,
+        on_conflict: &str,
     ) -> PyResult<Py<PyDict>> {
+        let policy = parse_on_conflict(on_conflict)?;
         // Parse nodes.
         let mut node_ops: Vec<(String, String, Vec<(String, Value)>)> =
             Vec::with_capacity(nodes.len());
@@ -1251,22 +1281,24 @@ impl GraphDb {
         }
 
         // Commit atomically via BatchBuilder; capture the actual WAL counts.
-        let (nodes_inserted, edges_inserted) = self.with_mut(|db| {
+        let outcome = self.with_mut(|db| {
             let mut batch = db.batch();
             for (label, key, props) in node_ops {
-                batch.insert_node(&label, &key, props);
+                batch.insert_node_on_conflict(&label, &key, props, policy);
             }
             for (edge_type, src, dst) in &edge_ops {
                 batch.insert_edge(edge_type, src, dst);
             }
-            batch.commit()
+            batch.commit_outcome()
         })?;
 
         // Build IngestReport-shaped dict with accurate counts.
         let d = PyDict::new(py);
-        d.set_item("inserted", nodes_inserted)?;
-        d.set_item("edges_inserted", edges_inserted)?;
-        d.set_item("row_errors", PyList::empty(py))?;
+        d.set_item("inserted", outcome.nodes_inserted)?;
+        d.set_item("edges_inserted", outcome.edges_inserted)?;
+        d.set_item("skipped", outcome.skipped)?;
+        d.set_item("replaced", outcome.replaced)?;
+        d.set_item("row_errors", outcome.row_errors)?;
         d.set_item("rules_created", PyList::empty(py))?;
         d.set_item("skipped_fk_fields", PyList::empty(py))?;
         Ok(d.unbind())
@@ -1789,6 +1821,19 @@ fn check_namespace(namespace: Option<&str>) -> PyResult<Option<&str>> {
              [A-Za-z0-9_.-]"
         ))),
         other => Ok(other),
+    }
+}
+
+/// `ingest_batch(on_conflict=)` — the spelling is part of the API, so an
+/// unknown one is a `ValueError` rather than a silent fall-back to `"error"`.
+fn parse_on_conflict(name: &str) -> PyResult<OnConflict> {
+    match name {
+        "error" => Ok(OnConflict::Error),
+        "skip" => Ok(OnConflict::Skip),
+        "replace" => Ok(OnConflict::Replace),
+        other => Err(PyValueError::new_err(format!(
+            "on_conflict must be \"error\", \"skip\" or \"replace\", got {other:?}"
+        ))),
     }
 }
 

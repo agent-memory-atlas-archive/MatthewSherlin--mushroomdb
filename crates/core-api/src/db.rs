@@ -5552,7 +5552,7 @@ impl<F: Fs> GraphDb<F> {
         // touches pending_write_authz); query_write_authz sets the field instead
         // and passes None.  Only one source is non-None per call.
         param_authz: Option<WriteAuthz>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<BatchOutcome> {
         // Read-only guard: catches empty-batch calls before the early-return
         // that skips log_then_apply_with, ensuring all mutation entry points fail.
         if self.read_only {
@@ -5622,15 +5622,77 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
+        let mut outcome = BatchOutcome::default();
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
+            // Which node row we are on, counted over the node-insert ops only.
+            // A caller that queues its rows in order reads this straight back
+            // as the index into its own list.
+            let mut node_row = 0usize;
+            // Every field name the store knows, which a `Replace` needs to work
+            // out what it removes. Resolved on the first `Replace` in the frame
+            // and reused, so N replaces read the field list once, not N times.
+            let mut store_fields: Option<Vec<String>> = None;
             for op in ops {
                 match op {
                     BatchOp::InsertNode { label, key, props } => {
+                        node_row += 1;
                         preview.check_insert_node(&key)?;
-                        preview.note_insert_node(&key, &props);
+                        preview.note_insert_node(&label, &key, &props);
                         recs.push(WalRecord::InsertNode { label, key, props });
+                    }
+                    BatchOp::InsertNodeOnConflict {
+                        label,
+                        key,
+                        props,
+                        on_conflict,
+                    } => {
+                        let row = node_row;
+                        node_row += 1;
+                        if !preview.has_key(&key) {
+                            // No conflict: an ordinary insert on any policy.
+                            preview.note_insert_node(&label, &key, &props);
+                            recs.push(WalRecord::InsertNode { label, key, props });
+                            continue;
+                        }
+                        match on_conflict {
+                            OnConflict::Error => {
+                                return Err(GraphError::DuplicateKey { key });
+                            }
+                            OnConflict::Skip => outcome.skipped += 1,
+                            OnConflict::Replace => {
+                                if store_fields.is_none() {
+                                    store_fields = Some(preview.db.props_view().field_names());
+                                }
+                                let fields = store_fields.as_deref().unwrap_or_default();
+                                match preview.plan_replace(&label, &key, &props, fields) {
+                                    Ok(writes) => {
+                                        for (field, value) in writes {
+                                            match value {
+                                                Some(value) => {
+                                                    preview.note_set_prop(&key, &field, &value);
+                                                    recs.push(WalRecord::SetProp {
+                                                        key: key.clone(),
+                                                        field,
+                                                        value,
+                                                    });
+                                                }
+                                                None => {
+                                                    preview.note_remove_prop(&key, &field);
+                                                    recs.push(WalRecord::RemoveProp {
+                                                        key: key.clone(),
+                                                        field,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        outcome.replaced += 1;
+                                    }
+                                    Err(why) => outcome.row_errors.push((row, why)),
+                                }
+                            }
+                        }
                     }
                     BatchOp::InsertEdge {
                         edge_type,
@@ -5711,7 +5773,7 @@ impl<F: Fs> GraphDb<F> {
                         for key in [&src_key, &dst_key] {
                             if !preview.has_key(key) {
                                 preview.check_insert_node(key)?;
-                                preview.note_insert_node(key, &[]);
+                                preview.note_insert_node(&placeholder_label, key, &[]);
                                 recs.push(WalRecord::InsertNode {
                                     label: placeholder_label.clone(),
                                     key: key.clone(),
@@ -5732,8 +5794,11 @@ impl<F: Fs> GraphDb<F> {
             }
             recs
         };
+        // A frame that is nothing but skips or refused rows writes no WAL, but
+        // it still has counts to report, so the early returns carry `outcome`
+        // rather than zeros.
         if recs.is_empty() {
-            return Ok((0, 0));
+            return Ok(outcome);
         }
         // rewrite_wal_dense converts every InsertNode/InsertEdge into its
         // *Id form, so only the dense variants can appear in `recs` here.
@@ -5743,13 +5808,13 @@ impl<F: Fs> GraphDb<F> {
         // empty `Batch` frame would still take a commit sequence and a WAL
         // record, so a batch that turns out to be nothing writes nothing.
         if recs.is_empty() {
-            return Ok((0, 0));
+            return Ok(outcome);
         }
-        let nodes_inserted = recs
+        outcome.nodes_inserted = recs
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertNodeId { .. }))
             .count();
-        let edges_inserted = recs
+        outcome.edges_inserted = recs
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertEdgeId { .. }))
             .count();
@@ -5760,11 +5825,11 @@ impl<F: Fs> GraphDb<F> {
         // short-circuit on single-op batches and silently skip the fsync.
         // Batched fsyncs only for multi-op batches; Relaxed always skips.
         self.log_then_apply_with(WalRecord::Batch(recs), ingest, self.fsync)?;
-        Ok((nodes_inserted, edges_inserted))
+        Ok(outcome)
     }
 
     fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
-        self.commit_logged_batch(ops, None, None)
+        self.commit_logged_batch(ops, None, None).map(inserted_pair)
     }
 
     /// Commit one submission WITHOUT an fsync — for use inside `commit_group`
@@ -5788,7 +5853,7 @@ impl<F: Fs> GraphDb<F> {
         // SAFETY: raw pointer into self; guard dropped within this frame.
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
-        self.commit_logged_batch(ops, None, None)
+        self.commit_logged_batch(ops, None, None).map(inserted_pair)
     }
 
     /// Commit multiple op-batches as a **group**: each submission gets its own
@@ -7498,6 +7563,7 @@ impl<F: Fs> GraphDb<F> {
     ) -> Result<(usize, usize)> {
         // Thread authz as a direct parameter — never touches pending_write_authz.
         self.commit_logged_batch(ops, None, authz.cloned())
+            .map(inserted_pair)
     }
 
     /// Execute a Cypher write statement with role-scoped write authorization.
@@ -7590,6 +7656,7 @@ impl<F: Fs> GraphDb<F> {
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
         self.commit_logged_batch(ops, None, authz.cloned())
+            .map(inserted_pair)
     }
 
     /// Execute a `/ingest` request with role-scoped write authorization.
@@ -7724,7 +7791,17 @@ impl<F: Fs> GraphDb<F> {
             // RenameNode / CreateRule / DeleteRule: defense-in-depth gate.
             // These ops are never routed to role-scoped paths by the HTTP layer,
             // but we 403 them here to close any future bypass route.
-            BatchOp::RenameNode { .. } | BatchOp::CreateRule(_) | BatchOp::DeleteRule { .. } => {
+            //
+            // InsertNodeOnConflict joins them: it is reachable only from the
+            // embedded Python binding, which has no role token, and `Replace`
+            // is a create and an update at once. Rather than split the decision
+            // table for an op no role-scoped path constructs, refuse it — a
+            // role-scoped caller writes through the ops that are already in the
+            // table.
+            BatchOp::RenameNode { .. }
+            | BatchOp::CreateRule(_)
+            | BatchOp::DeleteRule { .. }
+            | BatchOp::InsertNodeOnConflict { .. } => {
                 return Err(GraphError::RoleWriteDenied {
                     reason: "role-bound token: this endpoint is not permitted".into(),
                 });
@@ -10719,7 +10796,7 @@ impl<F: Fs> GraphDb<F> {
         ops: Vec<BatchOp>,
     ) -> Result<(usize, usize)> {
         self.check_preconditions(&preconds)?;
-        self.commit_logged_batch(ops, None, None)
+        self.commit_logged_batch(ops, None, None).map(inserted_pair)
     }
 
     /// Update the per-node last-change map for a WAL record at commit `seq`.
@@ -12477,6 +12554,58 @@ impl<F: Fs> GraphDb<F> {
     }
 }
 
+/// What a batch node insert does when its key is already taken.
+///
+/// A mirror rebuild writes a frame onto a store that already has content, so
+/// "the key exists" is a routine answer rather than a failure. The decision is
+/// made during the batch's existing validate pass, from one id-map lookup per
+/// row, so the frame stays atomic and re-ingest stays O(n).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnConflict {
+    /// Refuse the whole frame with [`GraphError::DuplicateKey`]. The default,
+    /// and the only behaviour before v0.6.10.
+    #[default]
+    Error,
+    /// Leave the stored node exactly as it is — properties, label and edges —
+    /// and count it in [`BatchOutcome::skipped`].
+    Skip,
+    /// Keep the key and make the node's properties **exactly** the supplied
+    /// props: supplied fields are set, fields absent from the supplied props
+    /// are removed. A supplied label that differs from the stored one, and a
+    /// supplied `ns` that would move the node, are row errors — relabelling is
+    /// [`GraphDb::rename_node`], not a side effect of a rebuild.
+    Replace,
+}
+
+/// What one committed batch did.
+///
+/// [`BatchBuilder::commit`] returns the first two fields as a tuple; the rest
+/// exist for [`OnConflict`] and are always zero / empty without it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BatchOutcome {
+    /// Node records actually written.
+    pub nodes_inserted: usize,
+    /// Edge records actually written. A duplicate edge is a silent no-op under
+    /// every policy — adjacency is a set — and is not counted.
+    pub edges_inserted: usize,
+    /// Rows whose key was taken and whose policy was [`OnConflict::Skip`].
+    pub skipped: usize,
+    /// Rows whose key was taken and whose policy was [`OnConflict::Replace`].
+    pub replaced: usize,
+    /// `(row, why)` for rows an [`OnConflict::Replace`] refused. `row` counts
+    /// node-insert ops in this batch from zero, which for a caller that queues
+    /// its nodes in order is the index of the offending node. The rest of the
+    /// frame still commits; the refused row changes nothing.
+    pub row_errors: Vec<(usize, String)>,
+}
+
+/// The `(nodes_inserted, edges_inserted)` pair every pre-0.6.10 commit entry
+/// point returns. Keeps those signatures unchanged now that the validate pass
+/// produces a [`BatchOutcome`].
+fn inserted_pair(outcome: BatchOutcome) -> (usize, usize) {
+    (outcome.nodes_inserted, outcome.edges_inserted)
+}
+
 /// Queued mutation for a [`BatchBuilder`] or [`GraphDb::commit_group`].
 ///
 /// The `submit_batch` / `commit_group` APIs accept `Vec<BatchOp>` so that
@@ -12528,6 +12657,16 @@ pub enum BatchOp {
         dst_key: String,
         placeholder_label: String,
     },
+    /// Insert `key`, or — when the key is already taken — do what `on_conflict`
+    /// says. Queued by [`BatchBuilder::insert_node_on_conflict`]; `Error`
+    /// queues a plain [`BatchOp::InsertNode`] instead, so this variant only
+    /// ever carries `Skip` or `Replace`.
+    InsertNodeOnConflict {
+        label: String,
+        key: String,
+        props: Vec<(String, Value)>,
+        on_conflict: OnConflict,
+    },
 }
 
 /// Three-way node visibility status used by `check_single_op_authz`.
@@ -12545,6 +12684,10 @@ enum NodeAuthzStatus {
 #[derive(Default)]
 struct Overlay {
     extra_keys: BTreeSet<String>,
+    /// Label of each node inserted earlier in this batch. The store does not
+    /// have these keys yet, so `label_of` cannot answer for them, and
+    /// `OnConflict::Replace` has to compare labels.
+    extra_labels: BTreeMap<String, String>,
     deleted_keys: BTreeSet<String>,
     extra_props: BTreeMap<(String, String), Value>,
     removed_props: BTreeSet<(String, String)>,
@@ -12873,6 +13016,106 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.db.syms.resolve(sym).map(str::to_string)
     }
 
+    /// The label `key` carries as this batch sees it — including a node
+    /// inserted earlier in the same batch, which the store does not have yet.
+    fn label_in_batch(&self, key: &str) -> Option<String> {
+        if self.overlay.deleted_keys.contains(key) {
+            return None;
+        }
+        if let Some(label) = self.overlay.extra_labels.get(key) {
+            return Some(label.clone());
+        }
+        self.label_of(key)
+    }
+
+    /// The property writes that make `key`'s props exactly `props`, or why the
+    /// row is refused.
+    ///
+    /// `Some(value)` is a set and `None` is a removal. `store_fields` is every
+    /// field name the store knows, hoisted by the caller so a frame of N
+    /// replaces reads the field list once rather than N times.
+    ///
+    /// The two refusals are row errors, not frame errors: a mirror rebuild
+    /// should learn which of its rows disagree with the store without losing
+    /// the rows that agree.
+    fn plan_replace(
+        &self,
+        label: &str,
+        key: &str,
+        props: &[(String, Value)],
+        store_fields: &[String],
+    ) -> std::result::Result<Vec<(String, Option<Value>)>, String> {
+        // A different label is a relabel, and a rebuild does not relabel: that
+        // is `rename_node` or an explicit write, never a side effect here.
+        let stored = self.label_in_batch(key).unwrap_or_default();
+        if stored != label {
+            return Err(format!(
+                "node {key}: on_conflict=\"replace\" will not relabel {stored:?} to {label:?}; \
+                 relabelling is rename_node or an explicit write"
+            ));
+        }
+        // `ns` is immutable. Replace removes what the supplied props omit, so
+        // an omitted `ns` is a move to `default` exactly as a different `ns` is
+        // a move to that one; both are the same refusal.
+        let from = self.namespace_in_batch(key);
+        let to = match props.iter().find(|(field, _)| field == NS_PROP) {
+            Some((_, Value::Str(ns))) => ns.clone(),
+            Some((_, value)) => {
+                return Err(format!(
+                    "node {key}: {NS_PROP} must be a string naming a namespace, got {value:?}"
+                ));
+            }
+            None => NS_DEFAULT.to_string(),
+        };
+        if to != from {
+            return Err(format!(
+                "node {key}: {NS_PROP} is immutable; on_conflict=\"replace\" cannot move it \
+                 from {from:?} to {to:?}"
+            ));
+        }
+
+        let supplied: BTreeSet<&str> = props.iter().map(|(field, _)| field.as_str()).collect();
+        let mut writes = Vec::new();
+        for (field, value) in props {
+            // `ns` names the namespace the node is already in, so the write is
+            // the no-op the dense-rewrite seam would drop anyway.
+            if field == NS_PROP {
+                continue;
+            }
+            if let Some(view_name) = self.db.view_store.view_for_prop(field) {
+                return Err(format!(
+                    "node {key}: property {field:?} is owned by view {view_name:?} and is \
+                     read-only"
+                ));
+            }
+            // Already exactly this value: a rebuild of an unchanged row should
+            // cost no WAL record.
+            if self.prop_value(key, field).as_ref() == Some(value) {
+                continue;
+            }
+            writes.push((field.clone(), Some(value.clone())));
+        }
+        // Everything the node still carries that the supplied props do not.
+        // `ns` is never removed: it is immutable, and the check above has
+        // already established the node stays where it is.
+        let overlay_fields = self
+            .overlay
+            .extra_props
+            .keys()
+            .filter(|(k, _)| k == key)
+            .map(|(_, field)| field.as_str());
+        let stale: BTreeSet<&str> = store_fields
+            .iter()
+            .map(String::as_str)
+            .chain(overlay_fields)
+            .filter(|field| {
+                *field != NS_PROP && !supplied.contains(field) && self.has_prop(key, field)
+            })
+            .collect();
+        writes.extend(stale.into_iter().map(|field| (field.to_string(), None)));
+        Ok(writes)
+    }
+
     /// The namespace `key` is in as this batch sees it — including a node
     /// inserted earlier in the same batch, which the store does not have yet.
     fn namespace_in_batch(&self, key: &str) -> String {
@@ -12945,9 +13188,12 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         }
     }
 
-    fn note_insert_node(&mut self, key: &str, props: &[(String, Value)]) {
+    fn note_insert_node(&mut self, label: &str, key: &str, props: &[(String, Value)]) {
         self.overlay.deleted_keys.remove(key);
         self.overlay.extra_keys.insert(key.to_string());
+        self.overlay
+            .extra_labels
+            .insert(key.to_string(), label.to_string());
         self.overlay.extra_props.retain(|(k, _), _| k != key);
         self.overlay.removed_props.retain(|(k, _)| k != key);
         for (field, value) in props {
@@ -13115,6 +13361,33 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
         self
     }
 
+    /// Queue a node insert whose answer to a taken key is `on_conflict`.
+    ///
+    /// [`OnConflict::Error`] queues exactly the op [`insert_node`](Self::insert_node)
+    /// does, so the default path is unchanged.
+    pub fn insert_node_on_conflict(
+        &mut self,
+        label: &str,
+        key: &str,
+        props: Vec<(String, Value)>,
+        on_conflict: OnConflict,
+    ) -> &mut Self {
+        self.ops.push(match on_conflict {
+            OnConflict::Error => BatchOp::InsertNode {
+                label: label.into(),
+                key: key.into(),
+                props,
+            },
+            on_conflict => BatchOp::InsertNodeOnConflict {
+                label: label.into(),
+                key: key.into(),
+                props,
+                on_conflict,
+            },
+        });
+        self
+    }
+
     pub fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> &mut Self {
         self.ops.push(BatchOp::InsertEdge {
             edge_type: edge_type.into(),
@@ -13221,12 +13494,20 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
         self.db.commit_batch(ops)
     }
 
+    /// [`commit`](Self::commit) with the full [`BatchOutcome`] — the counts a
+    /// caller needs when its rows carry an [`OnConflict`] policy.
+    pub fn commit_outcome(&mut self) -> Result<BatchOutcome> {
+        let ops = std::mem::take(&mut self.ops);
+        self.db.commit_logged_batch(ops, None, None)
+    }
+
     /// Same as [`commit`](Self::commit) but tail the inner events with
     /// [`MutationEvent::Ingested`] instead of [`MutationEvent::BatchApplied`].
     pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<(usize, usize)> {
         let ops = std::mem::take(&mut self.ops);
         self.db
             .commit_logged_batch(ops, Some((label.to_string(), inserted)), None)
+            .map(inserted_pair)
     }
 }
 

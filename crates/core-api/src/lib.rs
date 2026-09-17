@@ -28,11 +28,11 @@ pub use db::{ambiguous_exactness_warns, ambiguous_exactness_warns_reset};
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use db::{
     snapshot_version_at, valid_namespace, write_snapshot_bak, AsOfScope, BackupReport,
-    BatchBuilder, BatchOp, DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge, FsyncPolicy,
-    GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats, NodeInfo, NodeRef,
-    OpenOptions, Precondition, PredicateSummary, RuleStats, SlowQueryEntry, SlowQuerySnapshot,
-    SnapshotOptions, Stats, WhatIf, WriteAuthz, MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT,
-    NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
+    BatchBuilder, BatchOp, BatchOutcome, DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge,
+    FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats, NodeInfo,
+    NodeRef, OnConflict, OpenOptions, Precondition, PredicateSummary, RuleStats, SlowQueryEntry,
+    SlowQuerySnapshot, SnapshotOptions, Stats, WhatIf, WriteAuthz,
+    MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT, NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
 pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};
 

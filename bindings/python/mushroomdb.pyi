@@ -271,8 +271,22 @@ class GraphDb:
         self,
         nodes: Sequence[dict[str, Any]],
         edges: Sequence[dict[str, str]] | None = None,
+        on_conflict: Literal["error", "skip", "replace"] = "error",
     ) -> dict[str, Any]:
-        """Atomically ingest nodes and edges in a single WAL commit."""
+        """Atomically ingest nodes and edges in a single WAL commit.
+
+        `on_conflict` says what a node key that is already taken means:
+        `"error"` (the default) rejects the whole frame with `DuplicateKey`;
+        `"skip"` leaves the stored node untouched and counts it in `skipped`;
+        `"replace"` makes its properties exactly the supplied props — fields
+        absent from them are removed — and counts it in `replaced`. A label
+        that differs from the stored one, and an `ns` that would move the node,
+        are row errors under `"replace"`, not silent rewrites.
+
+        The report is `{inserted, edges_inserted, skipped, replaced,
+        row_errors, rules_created, skipped_fk_fields}`, where `row_errors` is a
+        list of `(index into nodes, why)`.
+        """
 
     def batch_edges(
         self,

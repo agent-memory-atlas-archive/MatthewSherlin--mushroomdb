@@ -12,7 +12,7 @@
 //! serve full-token client masks, where the caller already knows the key
 //! exists. That difference is the whole reason these methods exist.
 
-use core_api::{Dir, GraphDb, GraphError, NodeMask, RealFs};
+use core_api::{AlgoDir, Dir, GraphDb, GraphError, NodeMask, Predicate, RealFs, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -38,6 +38,54 @@ fn chain(name: &str) -> (std::path::PathBuf, GraphDb<RealFs>) {
     }
     db.insert_edge("LINKS", "a", "b").unwrap();
     db.insert_edge("LINKS", "b", "c").unwrap();
+    (dir, db)
+}
+
+/// `a → b` and `a → c`: one subject, two neighbours, so a count can tell the
+/// difference between filtering and not.
+fn star(name: &str) -> (std::path::PathBuf, GraphDb<RealFs>) {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    for key in ["a", "b", "c"] {
+        db.insert_node("Doc", key, vec![]).unwrap();
+    }
+    db.insert_edge("LINKS", "a", "b").unwrap();
+    db.insert_edge("LINKS", "a", "c").unwrap();
+    (dir, db)
+}
+
+/// `alice -[WORKS_AT]→ techcorp`, and a via-hop rule that derives
+/// `alice -[FIT]→ proj_a` **because of `techcorp`**.
+///
+/// The via node is the explanation's evidence and the only node in it that the
+/// two subjects do not already name — which is exactly why an `Explanation`
+/// cannot be redacted: it carries `via_edge`, the hop's *type*, and never the
+/// hop's key.
+fn via(name: &str) -> (std::path::PathBuf, GraphDb<RealFs>) {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    let tech = || vec![("industry".to_string(), Value::Str("tech".into()))];
+    db.insert_node("Org", "techcorp", tech()).unwrap();
+    db.insert_node("Person", "alice", tech()).unwrap();
+    db.insert_node("Project", "proj_a", tech()).unwrap();
+    db.insert_edge("WORKS_AT", "alice", "techcorp").unwrap();
+    db.create_rule(RuleDef {
+        name: "fit".into(),
+        src_label: "Person".into(),
+        dst_label: "Project".into(),
+        predicate: Predicate::FieldEqual {
+            field: "industry".into(),
+        },
+        edge_type: "FIT".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("Org".into()),
+        via_edge: Some("WORKS_AT".into()),
+        via_dir: None,
+        namespace: None,
+    })
+    .unwrap();
     (dir, db)
 }
 
@@ -163,6 +211,140 @@ fn scoped_reads_on_a_reader_snapshot_honour_the_same_contract() {
 
     match snap.neighborhood_scoped("c", 2, None, Dir::Both, &mask) {
         Err(GraphError::KeyNotFound { key }) => assert_eq!(key, "c"),
+        other => panic!("expected KeyNotFound, got {other:?}"),
+    }
+}
+
+// ── degree, degrees, explain (§5.3, §5.4) ────────────────────────────────────
+
+/// A count is a disclosure. Telling a caller that `a` has two neighbours when it
+/// may see only one of them says a second node exists — the same leak
+/// `scoped_node_edges_drops_hidden_endpoints` prevents, arrived at by
+/// arithmetic instead of by name.
+#[test]
+fn scoped_degree_counts_only_visible_neighbours() {
+    let (_dir, db) = star("degree-visible-only");
+    let mask = NodeMask::from_keys(&db, ["a", "b"]);
+
+    assert_eq!(
+        db.degree_scoped("a", None, AlgoDir::Out, &mask).unwrap(),
+        1,
+        "`c` is hidden, so it is not counted"
+    );
+    // Unscoped, `a` has two — the filter is doing the work, not the fixture.
+    assert_eq!(db.degree("a", None, AlgoDir::Out).unwrap(), 2);
+
+    // The edge type and direction legs stay honest under the filter.
+    assert_eq!(
+        db.degree_scoped("a", Some("LINKS"), AlgoDir::Both, &mask)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.degree_scoped("a", Some("NOSUCH"), AlgoDir::Both, &mask)
+            .unwrap(),
+        0,
+        "an unknown edge type is still 0, not an error"
+    );
+
+    // Widen the scope and the hidden neighbour reappears.
+    let all = NodeMask::from_keys(&db, ["a", "b", "c"]);
+    assert_eq!(db.degree_scoped("a", None, AlgoDir::Out, &all).unwrap(), 2);
+}
+
+/// Hidden and absent are one answer here too: a degree of 0 for a hidden
+/// subject would still confirm the key exists.
+#[test]
+fn scoped_degree_on_a_hidden_subject_is_key_not_found() {
+    let (_dir, db) = star("degree-hidden-subject");
+    let mask = NodeMask::from_keys(&db, ["a", "b"]);
+
+    match db.degree_scoped("c", None, AlgoDir::Both, &mask) {
+        Err(GraphError::KeyNotFound { key }) => assert_eq!(key, "c"),
+        other => panic!("expected KeyNotFound, got {other:?}"),
+    }
+    match db.degree_scoped("never-existed", None, AlgoDir::Both, &mask) {
+        Err(GraphError::KeyNotFound { key }) => assert_eq!(key, "never-existed"),
+        other => panic!("expected KeyNotFound, got {other:?}"),
+    }
+}
+
+/// `degrees` takes a key list, so the scope has to bite twice: a hidden key
+/// must not come back as a row, and the rows that do come back must carry
+/// visible-only counts.
+#[test]
+fn scoped_degrees_omits_hidden_keys_from_input_and_output() {
+    let (_dir, db) = star("degrees-omits-hidden");
+    let mask = NodeMask::from_keys(&db, ["a", "b"]);
+    let keys: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+
+    let got = db
+        .degrees_scoped(Some(&keys), None, None, None, AlgoDir::Both, None, &mask)
+        .unwrap();
+    assert_eq!(
+        got,
+        vec![("a".to_string(), 1u64), ("b".to_string(), 1u64)],
+        "`c` is hidden as a row, and as one of `a`'s neighbours"
+    );
+
+    // Unscoped: three rows, and `a` has two neighbours.
+    let all = db
+        .degrees(Some(&keys), None, None, None, AlgoDir::Both, None)
+        .unwrap();
+    assert_eq!(
+        all,
+        vec![
+            ("a".to_string(), 2u64),
+            ("b".to_string(), 1u64),
+            ("c".to_string(), 1u64),
+        ]
+    );
+
+    // The label-scan leg (`keys = None`) is filtered on the same terms.
+    let scanned = db
+        .degrees_scoped(None, Some("Doc"), None, None, AlgoDir::Both, None, &mask)
+        .unwrap();
+    assert_eq!(
+        scanned.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"],
+        "a label scan must not enumerate hidden nodes"
+    );
+}
+
+/// A via-hop rule's evidence *is* the via node: `alice` and `proj_a` are linked
+/// only because `techcorp` sits between them. `Explanation` names the hop's
+/// edge type and never the hop's key, so there is nothing to redact — the
+/// explanation goes, or the hidden node's existence is disclosed.
+#[test]
+fn scoped_explain_omits_a_path_through_a_hidden_node() {
+    let (_dir, db) = via("explain-hidden-via");
+
+    // Unscoped, the explanation exists — the fixture does derive the edge.
+    let full = db.explain("alice", "proj_a").unwrap();
+    assert_eq!(full.len(), 1, "fixture must derive one edge: {full:?}");
+    assert_eq!(full[0].rule, "fit");
+    assert_eq!(full[0].via_edge.as_deref(), Some("WORKS_AT"));
+
+    // Both subjects visible, the via node hidden: nothing to say.
+    let hides_via = NodeMask::from_keys(&db, ["alice", "proj_a"]);
+    assert_eq!(
+        db.explain_scoped("alice", "proj_a", &hides_via).unwrap(),
+        Vec::<core_api::Explanation>::new(),
+        "the only evidence runs through hidden `techcorp`"
+    );
+
+    // Show the via node and the explanation returns intact, not redacted.
+    let all = NodeMask::from_keys(&db, ["alice", "proj_a", "techcorp"]);
+    assert_eq!(db.explain_scoped("alice", "proj_a", &all).unwrap(), full);
+
+    // Either endpoint hidden — or absent — is `KeyNotFound` (§5.3).
+    let hides_dst = NodeMask::from_keys(&db, ["alice", "techcorp"]);
+    match db.explain_scoped("alice", "proj_a", &hides_dst) {
+        Err(GraphError::KeyNotFound { key }) => assert_eq!(key, "proj_a"),
+        other => panic!("expected KeyNotFound, got {other:?}"),
+    }
+    match db.explain_scoped("never-existed", "proj_a", &all) {
+        Err(GraphError::KeyNotFound { key }) => assert_eq!(key, "never-existed"),
         other => panic!("expected KeyNotFound, got {other:?}"),
     }
 }

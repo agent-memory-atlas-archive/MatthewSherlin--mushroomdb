@@ -10084,6 +10084,99 @@ impl<F: Fs> GraphDb<F> {
         Ok(results)
     }
 
+    /// [`explain`](Self::explain) with the scoped read contract (§5.3): both
+    /// endpoints are subject-checked, and any explanation whose evidence runs
+    /// through a hidden node is **dropped entirely, not redacted**.
+    ///
+    /// A plain two-node rule's evidence is the pair itself, so once both
+    /// subjects are visible there is nothing left to hide. A **via-hop** rule is
+    /// different: it fires `src → dst` because some node carrying `via_label`
+    /// sits between them, and [`Explanation`] carries the hop's edge *type*
+    /// (`via_edge`) and never the hop's key. There is no field to blank, so a
+    /// redacted explanation would still say "these two are linked through
+    /// something you cannot see" — which discloses that the something exists.
+    /// The explanation is therefore kept only when at least one **visible** via
+    /// node satisfies the rule on its own.
+    ///
+    /// Hidden or unknown `key_a` or `key_b` → [`GraphError::KeyNotFound`].
+    pub fn explain_scoped(
+        &self,
+        key_a: &str,
+        key_b: &str,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<Explanation>> {
+        for key in [key_a, key_b] {
+            if !mask.contains_node(self, key) {
+                return Err(GraphError::KeyNotFound { key: key.into() });
+            }
+        }
+        Ok(self
+            .explain(key_a, key_b)?
+            .into_iter()
+            .filter(|e| self.explanation_evidence_is_visible(e, mask))
+            .collect())
+    }
+
+    /// Whether `e` stands for a caller limited to `mask`.
+    ///
+    /// True for every non-via-hop explanation: its only nodes are the two
+    /// subjects, which [`explain_scoped`](Self::explain_scoped) has already
+    /// checked. For a via-hop rule, true when some via node the mask admits
+    /// satisfies the rule's predicate against the destination — the same walk
+    /// the rule engine makes, narrowed to the visible hops.
+    fn explanation_evidence_is_visible(
+        &self,
+        e: &Explanation,
+        mask: &crate::mask::NodeMask,
+    ) -> bool {
+        let Some(via_edge) = e.via_edge.as_deref() else {
+            return true;
+        };
+        let Some(rule_def) = self.engine.rules().find(|r| r.name == e.rule) else {
+            // The rule is gone but its provenance is not; nothing can vouch for
+            // the hop, so nothing is shown.
+            return false;
+        };
+        let Some(via_label) = rule_def.via_label.as_deref() else {
+            return true;
+        };
+        let (Some(src), Some(dst)) = (self.ids.get(&e.src_key), self.ids.get(&e.dst_key)) else {
+            return false;
+        };
+        let (Some(via_etype), Some(via_sym)) = (self.syms.get(via_edge), self.syms.get(via_label))
+        else {
+            return false;
+        };
+        let via_dir = rule_def.via_dir.unwrap_or(Direction::Out);
+        let props_view = build_props_view(&self.props, &self.base);
+        let dst_get = |field: &str| props_view.get(dst, field).map(|vr| vr.into_value());
+        let dst_view = NodeView {
+            key: &e.dst_key,
+            props: &dst_get,
+        };
+        self.topo_view()
+            .neighbors(via_etype, via_dir, src)
+            .iter()
+            .copied()
+            .any(|via| {
+                if !mask.contains_id(via) {
+                    return false;
+                }
+                if self.labels.get(via as usize).copied() != Some(via_sym) {
+                    return false;
+                }
+                let Some(via_key) = self.ids.key_of(via) else {
+                    return false;
+                };
+                let via_get = |field: &str| props_view.get(via, field).map(|vr| vr.into_value());
+                let via_view = NodeView {
+                    key: via_key,
+                    props: &via_get,
+                };
+                evaluate(&rule_def.predicate, &via_view, &dst_view).is_some()
+            })
+    }
+
     pub fn neighbors(&self, key: &str, edge_type: &str, dir: Direction) -> Result<Vec<String>> {
         let id = self
             .ids
@@ -10124,6 +10217,34 @@ impl<F: Fs> GraphDb<F> {
         ))
     }
 
+    /// [`degree`](Self::degree) counting **only neighbours the mask admits**.
+    ///
+    /// The filter is a correctness requirement, not an optimisation: an
+    /// unfiltered count discloses the existence of a hidden neighbour to a
+    /// caller who cannot see it, which is the same leak
+    /// [`node_edges_scoped`](Self::node_edges_scoped) exists to prevent —
+    /// reached by arithmetic instead of by name.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`]. Unknown
+    /// `edge_type` is still 0, as it is unscoped.
+    pub fn degree_scoped(
+        &self,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<u64> {
+        let id = self
+            .ids
+            .get(key)
+            .filter(|&id| mask.contains_id(id))
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        let topo = self.topo_view();
+        Ok(Self::visible_directed_degree(
+            &topo, &self.syms, id, edge_type, direction, mask,
+        ))
+    }
+
     /// Unique directed degree for a subset or a label scan.
     ///
     /// Unknown keys in `keys` are omitted (mask-like). `keys = Some(&[])` →
@@ -10138,6 +10259,47 @@ impl<F: Fs> GraphDb<F> {
         edge_type: Option<&str>,
         direction: crate::algo::AlgoDir,
         limit: Option<usize>,
+    ) -> Result<Vec<(String, u64)>> {
+        self.degrees_inner(keys, label, where_, edge_type, direction, limit, None)
+    }
+
+    /// [`degrees`](Self::degrees) with the scope applied on both sides: a hidden
+    /// key is omitted from the input — whether it arrived in `keys` or came out
+    /// of the `label`/`where_` scan — and every row's count is the count of its
+    /// **visible** neighbours, for the reason
+    /// [`degree_scoped`](Self::degree_scoped) documents.
+    ///
+    /// Unlike `degree_scoped`, a hidden key here is not
+    /// [`GraphError::KeyNotFound`]: `degrees` already drops unknown keys
+    /// silently, so hidden and absent stay one answer by staying out of the
+    /// result. `limit` still applies after the sort, and so counts visible rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn degrees_scoped(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<(String, u64)>> {
+        self.degrees_inner(keys, label, where_, edge_type, direction, limit, Some(mask))
+    }
+
+    /// The body shared by [`degrees`](Self::degrees) and
+    /// [`degrees_scoped`](Self::degrees_scoped). `mask = None` is the unscoped
+    /// contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn degrees_inner(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+        mask: Option<&crate::mask::NodeMask>,
     ) -> Result<Vec<(String, u64)>> {
         if let Some(pred) = where_ {
             pred.validate_named("where")
@@ -10175,10 +10337,18 @@ impl<F: Fs> GraphDb<F> {
         };
         let mut out: Vec<(String, u64)> = ids
             .into_iter()
+            // A hidden candidate leaves as quietly as an unknown key does.
+            .filter(|&id| mask.is_none_or(|m| m.contains_id(id)))
             .filter_map(|id| {
                 let key = self.ids.key_of(id)?.to_string();
-                let deg =
-                    Self::unique_directed_degree(&view.topo, view.syms, id, edge_type, direction);
+                let deg = match mask {
+                    Some(m) => Self::visible_directed_degree(
+                        &view.topo, view.syms, id, edge_type, direction, m,
+                    ),
+                    None => Self::unique_directed_degree(
+                        &view.topo, view.syms, id, edge_type, direction,
+                    ),
+                };
                 Some((key, deg))
             })
             .collect();
@@ -10218,6 +10388,42 @@ impl<F: Fs> GraphDb<F> {
                         .sum::<u64>()
                 })
                 .sum(),
+        }
+    }
+
+    /// [`unique_directed_degree`](Self::unique_directed_degree) counting only
+    /// neighbours `mask` admits.
+    ///
+    /// Same shape, one substitution: `topo.degree` is a length, so it cannot be
+    /// filtered; the neighbour list it measures can. `Both` still sums out + in,
+    /// so a node visible on both sides still counts twice — the filter changes
+    /// which neighbours are counted, never how a degree is defined.
+    fn visible_directed_degree(
+        topo: &TopologyView<'_>,
+        syms: &Interner,
+        id: u32,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        mask: &crate::mask::NodeMask,
+    ) -> u64 {
+        let dirs: &[Direction] = match direction {
+            crate::algo::AlgoDir::Out => &[Direction::Out],
+            crate::algo::AlgoDir::In => &[Direction::In],
+            crate::algo::AlgoDir::Both => &[Direction::Out, Direction::In],
+        };
+        let visible = |et: u32| -> u64 {
+            dirs.iter()
+                .map(|&d| {
+                    topo.neighbors(et, d, id)
+                        .iter()
+                        .filter(|&&n| mask.contains_id(n))
+                        .count() as u64
+                })
+                .sum()
+        };
+        match edge_type {
+            Some(name) => syms.get(name).map_or(0, visible),
+            None => topo.etypes().map(visible).sum(),
         }
     }
 

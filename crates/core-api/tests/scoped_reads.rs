@@ -790,6 +790,105 @@ fn scoped_hybrid_filters_before_fusion() {
     );
 }
 
+/// The advice a warning gives has to be reachable from the call that triggered
+/// it. `search_hybrid` and `search_hybrid_scoped` take neither `exact` nor
+/// `where`, so the vector leg's line cannot tell a hybrid caller to "pass
+/// exact=True" — they would go looking for an argument that does not exist.
+///
+/// The warning is not suppressed on this path: the approximation is just as
+/// real, and a hybrid caller who read `mask=` as a promise of exhaustiveness is
+/// exactly the reader it was written for. Only the advice changes, to name a
+/// call that does accept the argument.
+#[test]
+fn the_hybrid_path_advises_a_call_the_hybrid_caller_can_make() {
+    let dir = tmp("exactness-warning-hybrid");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.enable_fulltext("Item", "body").unwrap();
+    for i in 0..8u32 {
+        let x = 0.5 + i as f64 * 0.05;
+        db.insert_node(
+            "Item",
+            &format!("v{i}"),
+            vec![
+                ("body".into(), Value::Str("unique".into())),
+                ("emb".into(), emb(&[x, 1.0 - x])),
+            ],
+        )
+        .unwrap();
+    }
+    db.create_rule(RuleDef {
+        name: "ann".into(),
+        src_label: "Item".into(),
+        dst_label: "Item".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 1.0,
+        },
+        edge_type: "SIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    })
+    .unwrap();
+    assert!(db.has_vector_rule("emb"), "an index must cover the field");
+
+    let visible: Vec<String> = (0..6).map(|i| format!("v{i}")).collect();
+    let mask = NodeMask::from_keys(&db, visible.iter().map(String::as_str));
+    let q = [1.0_f64, 0.0];
+
+    core_api::ambiguous_exactness_warns_reset();
+    db.search_hybrid_scoped("body", "unique", "emb", &q, Some("Item"), 3, &mask);
+    assert_eq!(
+        core_api::ambiguous_exactness_warns(),
+        1,
+        "a masked hybrid search rides the same approximate leg, and says so"
+    );
+    let hybrid = core_api::ambiguous_exactness_last_warning()
+        .expect("the warning that was counted must also have been recorded");
+    assert!(
+        !hybrid.contains("pass exact=True or a where= predicate"),
+        "the hybrid line must not name arguments `search_hybrid` cannot accept: {hybrid}"
+    );
+    assert!(
+        hybrid.contains("search_hybrid") && hybrid.contains("find_similar("),
+        "it must say which call takes no exactness argument, and which one does: {hybrid}"
+    );
+    assert!(
+        hybrid.contains("the vector leg of a masked hybrid search"),
+        "and which of the caller's two legs it is about: {hybrid}"
+    );
+
+    // The direct call keeps the original advice: `exact` and `where` really are
+    // its own parameters, so naming them is the whole point.
+    core_api::ambiguous_exactness_warns_reset();
+    db.find_similar_vector_masked("emb", Some("Item"), &q, 3, 0.0, &mask);
+    let direct = core_api::ambiguous_exactness_last_warning().expect("the direct line is recorded");
+    assert!(
+        direct.contains("pass exact=True or a where= predicate"),
+        "`find_similar` does take both, so its advice is unchanged: {direct}"
+    );
+
+    // Each caller shape gets its own once-per-index entry: a direct call that
+    // warned first must not silence the hybrid line that carries the other
+    // advice. Both have now warned, so both are silent from here.
+    assert_eq!(
+        core_api::ambiguous_exactness_warns(),
+        1,
+        "the direct line is not suppressed by the hybrid one"
+    );
+    db.search_hybrid_scoped("body", "unique", "emb", &q, Some("Item"), 3, &mask);
+    db.find_similar_vector_masked("emb", Some("Item"), &q, 3, 0.0, &mask);
+    assert_eq!(
+        core_api::ambiguous_exactness_warns(),
+        1,
+        "and neither repeats on the same index"
+    );
+}
+
 /// `mask=` alone rides the widening beam. That is deliberate — making a mask
 /// imply `exact` would turn every existing masked caller's ANN into an O(n)
 /// GEMM — but it cost a real integration team real time, because nothing said

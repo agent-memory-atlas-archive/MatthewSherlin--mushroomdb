@@ -107,6 +107,8 @@ pub fn reset_query_sub_exec_count() {
 // mistaken for this test's.
 thread_local! {
     static AMBIGUOUS_EXACTNESS_WARNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static AMBIGUOUS_EXACTNESS_LAST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// How many times a masked, non-exact vector search has explained itself on
@@ -114,15 +116,79 @@ thread_local! {
 ///
 /// The line itself is the product; this counter exists so a test can assert it
 /// is printed **once per index** rather than once per call.
+///
+/// **Single-threaded assertions only.** The suppression set this counts is a
+/// `Mutex<HashSet<_>>` on the `GraphDb` — shared by every thread — while the
+/// counter is thread-local. Under a concurrent caller (`serve`, which is the
+/// deployment the warning exists for) the thread that prints the line is not
+/// necessarily the thread that asked, so a zero here does not mean the line was
+/// not printed and a one does not mean it was printed once. It answers
+/// "once per index" only in a test that owns the store.
 #[doc(hidden)]
 pub fn ambiguous_exactness_warns() -> u64 {
     AMBIGUOUS_EXACTNESS_WARNS.with(|c| c.get())
 }
 
-/// Reset this thread's exactness-warning counter to zero.
+/// The most recent exactness warning printed on this thread, verbatim.
+///
+/// The advice a caller reads has to be advice that caller can act on, which the
+/// counter alone cannot witness — see
+/// `the_hybrid_path_advises_a_call_the_hybrid_caller_can_make`. Carries the
+/// same single-threaded caveat as [`ambiguous_exactness_warns`].
+#[doc(hidden)]
+pub fn ambiguous_exactness_last_warning() -> Option<String> {
+    AMBIGUOUS_EXACTNESS_LAST.with(|c| c.borrow().clone())
+}
+
+/// Reset this thread's exactness-warning counter and recorded line.
 #[doc(hidden)]
 pub fn ambiguous_exactness_warns_reset() {
     AMBIGUOUS_EXACTNESS_WARNS.with(|c| c.set(0));
+    AMBIGUOUS_EXACTNESS_LAST.with(|c| *c.borrow_mut() = None);
+}
+
+/// Which signature reached the approximate masked vector leg.
+///
+/// One code path, two entry points, and the advice cannot be the same: a
+/// warning that names an argument the caller's function does not take sends
+/// them looking for a parameter that is not there. `search_hybrid` and
+/// `search_hybrid_scoped` take `(text_field, query_text, vector_field,
+/// query_vec, label, k[, mask])` — no `exact`, no `where`.
+///
+/// The warning is not suppressed on the hybrid path. The approximation is the
+/// same one, and a caller who read `mask=` as a promise of exhaustiveness is
+/// the reader it was written for whichever door they came in by; only the
+/// remedy differs, so only the remedy changes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ExactnessCaller {
+    /// `find_similar` / `find_similar_vector_*` — `exact` and `where` are its
+    /// own parameters.
+    Vector,
+    /// `search_hybrid` / `search_hybrid_scoped` — neither argument exists, and
+    /// the leg is one half of a fusion.
+    Hybrid,
+}
+
+impl ExactnessCaller {
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Vector => "a masked vector search",
+            Self::Hybrid => "the vector leg of a masked hybrid search",
+        }
+    }
+
+    fn advice(self) -> &'static str {
+        match self {
+            Self::Vector => "pass exact=True or a where= predicate.",
+            // Names the call that does take the argument, because this one
+            // does not: the caller's own next step, not a parameter hunt.
+            Self::Hybrid => {
+                "search_hybrid takes no exactness argument — run the vector leg on its \
+                 own with find_similar(field, vector, mask=…, exact=True) and fuse it \
+                 with search() yourself."
+            }
+        }
+    }
 }
 
 /// Internal state for a single `subscribe_query` subscription.
@@ -1576,12 +1642,15 @@ pub struct GraphDb<F: Fs> {
     /// Ring buffer of recent slow queries (interior-mutable so `query(&self)`
     /// can record entries without requiring `&mut self`).
     slow_queries: std::sync::Mutex<SlowQueryLog>,
-    /// `(field, label)` pairs whose exact-versus-approximate ambiguity this
-    /// handle has already explained once. See
+    /// `(field, label, caller)` triples whose exact-versus-approximate
+    /// ambiguity this handle has already explained once. See
     /// [`note_ambiguous_exactness`](GraphDb::note_ambiguous_exactness).
+    /// The caller shape is part of the key because the two shapes give
+    /// different advice — silencing one with the other would leave a caller
+    /// reading advice meant for a signature it does not have.
     /// Advice bookkeeping, not graph state: a reload keeps it, as the
     /// slow-query log does.
-    warned_ambiguous_exactness: std::sync::Mutex<HashSet<(String, String)>>,
+    warned_ambiguous_exactness: std::sync::Mutex<HashSet<(String, String, ExactnessCaller)>>,
     /// Instant at which the database was opened (used by `/metrics` uptime).
     started_at: std::time::Instant,
     // ── Multi-process state (cross-process lock + WAL tailing) ────────────────
@@ -3215,6 +3284,35 @@ impl<F: Fs> GraphDb<F> {
             self.commit_seq,
             Arc::clone(&self.role_masks),
         )
+    }
+
+    /// Append a delta the reader cannot apply, so that a corrupt overlay is
+    /// reachable from a test.
+    ///
+    /// [`ReaderSnapshot::effective`](crate::reader::ReaderSnapshot) folds the
+    /// delta tail into a clone of the frozen overlay and answers
+    /// [`GraphError::Corrupt`] when a record will not apply. Nothing a caller
+    /// can do produces that state — `apply_one`'s failures are disagreements
+    /// between the tail and the fold it is applied to, which the write path
+    /// cannot create — so the `Corrupt` arm of every scoped reader method was
+    /// reachable only by inspection until this hook existed. An `Intern` record
+    /// claiming an id the frozen interner will not hand back is the smallest
+    /// such disagreement.
+    ///
+    /// Only the tail is touched. This handle's own state is untouched and
+    /// `commit_seq` does not move, so a role mask already memoised at this
+    /// version stays memoised — which is exactly the state in which the HTTP
+    /// role branches reach a scoped read with a corrupt overlay under them.
+    #[doc(hidden)]
+    pub fn push_unapplyable_delta_for_test(&mut self) {
+        self.delta_tail.push(Arc::new(crate::reader::CommitDelta {
+            records: vec![WalRecord::Intern {
+                id: u32::MAX,
+                text: "delta-tail-corruption".into(),
+            }],
+            derived_inserts: Vec::new(),
+            derived_deletes: Vec::new(),
+        }));
     }
 
     /// Total number of WAL commits at the time [`open_at`] was called.
@@ -6796,12 +6894,22 @@ impl<F: Fs> GraphDb<F> {
         // Vector leg (skipped when query_vec is empty). The masked variant
         // applies the mask before its own k-truncation, for the same reason.
         if !query_vec.is_empty() {
-            let vec_hits = match mask {
-                Some(m) => {
-                    self.find_similar_vector_masked(vector_field, label, query_vec, pool, 0.0, m)
-                }
-                None => self.find_similar_vector(vector_field, label, query_vec, pool, 0.0),
-            };
+            // `ExactnessCaller::Hybrid`: the leg is the same one
+            // `find_similar_vector_masked` runs, but the advice its warning
+            // gives has to fit *this* signature, which has no `exact`.
+            let vec_hits = self
+                .find_similar_vector_as(
+                    vector_field,
+                    label,
+                    query_vec,
+                    pool,
+                    0.0,
+                    mask,
+                    None,
+                    false,
+                    ExactnessCaller::Hybrid,
+                )
+                .expect("find_similar_vector_as is infallible without where_");
             for (rank0, (key, _sim)) in vec_hits.into_iter().enumerate() {
                 let rank = (rank0 + 1) as f64;
                 *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
@@ -9019,6 +9127,35 @@ impl<F: Fs> GraphDb<F> {
         where_: Option<&PropPredicate>,
         exact: bool,
     ) -> Result<Vec<(String, f64)>> {
+        self.find_similar_vector_as(
+            field,
+            label,
+            q,
+            k,
+            min,
+            mask,
+            where_,
+            exact,
+            ExactnessCaller::Vector,
+        )
+    }
+
+    /// [`find_similar_vector_filtered`](Self::find_similar_vector_filtered)
+    /// with the caller shape named, so the exactness warning can advise the
+    /// signature that actually reached it. Everything else is identical.
+    #[allow(clippy::too_many_arguments)]
+    fn find_similar_vector_as(
+        &self,
+        field: &str,
+        label: Option<&str>,
+        q: &[f64],
+        k: usize,
+        min: f64,
+        mask: Option<&crate::mask::NodeMask>,
+        where_: Option<&PropPredicate>,
+        exact: bool,
+        caller: ExactnessCaller,
+    ) -> Result<Vec<(String, f64)>> {
         if let Some(pred) = where_ {
             pred.validate_named("where")
                 .map_err(|detail| GraphError::QueryError { detail })?;
@@ -9049,7 +9186,7 @@ impl<F: Fs> GraphDb<F> {
         if !skip_hnsw {
             if let Some(mask) = mask {
                 if let Some(out) =
-                    self.find_similar_hnsw_masked(field, label, &q_unit, k, min, mask)
+                    self.find_similar_hnsw_masked(field, label, &q_unit, k, min, mask, caller)
                 {
                     return Ok(out);
                 }
@@ -9109,6 +9246,7 @@ impl<F: Fs> GraphDb<F> {
 
     /// Masked HNSW widening beam. `None` when no index covers the request or
     /// the beam cannot admit `k` visible hits (caller falls through to brute).
+    #[allow(clippy::too_many_arguments)]
     fn find_similar_hnsw_masked(
         &self,
         field: &str,
@@ -9117,6 +9255,7 @@ impl<F: Fs> GraphDb<F> {
         k: usize,
         min: f64,
         mask: &crate::mask::NodeMask,
+        caller: ExactnessCaller,
     ) -> Option<Vec<(String, f64)>> {
         let index_len = match label {
             Some(lbl) => self.engine.hnsw_dst_len(field, lbl, q_unit.len()),
@@ -9125,7 +9264,7 @@ impl<F: Fs> GraphDb<F> {
         let n = index_len?;
         // The `?` above is the coverage test: past it, an index exists and this
         // masked, non-exact call is about to ride it.
-        self.note_ambiguous_exactness(field, label);
+        self.note_ambiguous_exactness(field, label, caller);
         // Same ceiling the exact-rule widening loop in `hnsw_candidates`
         // consults — including the `with_ef_max` test hook.
         let cap = ef_max();
@@ -9163,8 +9302,8 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
-    /// Say once, per `(field, label)` index, that a masked search is answering
-    /// approximately.
+    /// Say once, per `(field, label)` index and caller shape, that a masked
+    /// search is answering approximately.
     ///
     /// A mask narrows *which nodes may be returned*. It does not choose a
     /// kernel — `exact=true` and a `where=` predicate do, and nothing else
@@ -9180,8 +9319,12 @@ impl<F: Fs> GraphDb<F> {
     /// Printed once per index for the reason the dimension-mismatch skip in
     /// `core_rules::hnsw` is: a line on every call is a line callers learn to
     /// scroll past.
-    fn note_ambiguous_exactness(&self, field: &str, label: Option<&str>) {
-        let entry = (field.to_string(), label.unwrap_or("").to_string());
+    ///
+    /// `caller` decides the advice. The same leg is reached from two signatures
+    /// and only one of them has an `exact` argument to pass; see
+    /// [`ExactnessCaller`].
+    fn note_ambiguous_exactness(&self, field: &str, label: Option<&str>, caller: ExactnessCaller) {
+        let entry = (field.to_string(), label.unwrap_or("").to_string(), caller);
         let first = match self.warned_ambiguous_exactness.lock() {
             Ok(mut seen) => seen.insert(entry),
             Err(poisoned) => poisoned.into_inner().insert(entry),
@@ -9194,13 +9337,17 @@ impl<F: Fs> GraphDb<F> {
             Some(lbl) => format!(" (label `{lbl}`)"),
             None => String::new(),
         };
-        eprintln!(
-            "mushroomdb: a masked vector search on field `{field}`{which} is answering \
+        let subject = caller.subject();
+        let advice = caller.advice();
+        let line = format!(
+            "mushroomdb: {subject} on field `{field}`{which} is answering \
              approximately. A mask narrows which nodes may be returned; it does not \
              change which kernel runs, and an index covers this field. For an exact \
-             answer over the same visible candidate set, pass exact=True or a where= \
-             predicate. Further masked searches on this index are silent."
+             answer over the same visible candidate set, {advice} Further masked \
+             searches of this shape on this index are silent."
         );
+        AMBIGUOUS_EXACTNESS_LAST.with(|c| *c.borrow_mut() = Some(line.clone()));
+        eprintln!("{line}");
     }
 
     /// `label ∩ mask ∩ holds(where)`. Index fast path when `label` is `Some`

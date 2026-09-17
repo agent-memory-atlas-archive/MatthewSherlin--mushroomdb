@@ -1426,36 +1426,17 @@ async fn node_edges(
     if let AuthIdentity::Role(ref role_name) = identity {
         // Role-token path: hard-coded Omit mode.  `stub_hidden` query param is
         // silently ignored — role paths must NEVER produce stubs (RBAC invariant).
+        //
+        // The subject check and the hidden-endpoint filter live in
+        // `ReaderSnapshot::node_edges_scoped`, so every scoped caller gets them,
+        // not only this route.
         let snap = state.db.reader();
         let role_mask = match snap.mask_for_role(role_name) {
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
-        if !snap
-            .resolve_key(&key)
-            .is_some_and(|id| role_mask.contains_id(id))
-        {
-            return key_not_found(key);
-        }
-        return match snap.node_edges(&key) {
-            Ok(edges) => {
-                // Filter out edges whose OTHER endpoint is hidden in the role
-                // mask.  A role token must not learn about hidden neighbors via
-                // the edge list even when the entry key itself is visible.
-                let visible: Vec<_> = edges
-                    .into_iter()
-                    .filter(|e| {
-                        let other = if e.src_key == key {
-                            &e.dst_key
-                        } else {
-                            &e.src_key
-                        };
-                        snap.resolve_key(other)
-                            .is_some_and(|id| role_mask.contains_id(id))
-                    })
-                    .collect();
-                json_ok(node_edges_json(&visible))
-            }
+        return match snap.node_edges_scoped(&key, &role_mask) {
+            Ok(edges) => json_ok(node_edges_json(&edges)),
             Err(GraphError::KeyNotFound { key }) => key_not_found(key),
             Err(e) => graph_err(e),
         };
@@ -1533,20 +1514,14 @@ async fn neighborhood(
             Ok(m) => m,
             Err(e) => return role_mask_err(e),
         };
-        if !snap
-            .resolve_key(&key)
-            .is_some_and(|id| role_mask.contains_id(id))
-        {
-            return key_not_found(key);
-        }
-        // Use the mask-aware BFS: hidden nodes are excluded from results AND
-        // cannot be used as traversal intermediaries (never-leak invariant).
-        let rs = match snap.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &role_mask)
-        {
-            Some(rs) => rs,
-            None => return key_not_found(key),
+        // The scoped BFS: the subject is checked first (a hidden key answers as
+        // an absent one), and hidden nodes are excluded from results AND cannot
+        // be used as traversal intermediaries (never-leak invariant).
+        return match snap.neighborhood_scoped(&key, depth, etype_refs.as_deref(), dir, &role_mask) {
+            Ok(rs) => json_ok(result_set_json(&rs)),
+            Err(GraphError::KeyNotFound { key }) => key_not_found(key),
+            Err(e) => graph_err(e),
         };
-        return json_ok(result_set_json(&rs));
     }
     // Full-token path: optional client mask + stub_hidden via query params.
     // `mask=key1,key2` — comma-separated visible keys.

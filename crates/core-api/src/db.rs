@@ -8015,6 +8015,35 @@ impl<F: Fs> GraphDb<F> {
         Some(rs)
     }
 
+    /// [`neighborhood_masked`](Self::neighborhood_masked) with the **subject
+    /// check** a scoped caller needs: a start key the mask hides answers exactly
+    /// as an absent one does.
+    ///
+    /// `neighborhood_masked` expands from any existing key, hidden or not,
+    /// because a full-token caller supplying a client mask already knows which
+    /// keys exist. A scoped caller does not, so telling it apart a hidden key
+    /// from an absent one would be an existence oracle.
+    ///
+    /// Expansion itself is unchanged: hidden nodes are neither returned nor used
+    /// as traversal intermediaries, so a visible node reachable only through a
+    /// hidden one stays out of the result.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
+    pub fn neighborhood_scoped(
+        &self,
+        key: &str,
+        depth: u32,
+        edge_types: Option<&[&str]>,
+        dir: Dir,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<ResultSet> {
+        if !mask.contains_node(self, key) {
+            return Err(GraphError::KeyNotFound { key: key.into() });
+        }
+        self.neighborhood_masked(key, depth, edge_types, dir, mask)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })
+    }
+
     /// Live node's key, label, and columnar props. Unknown or tombstoned → `None`.
     pub fn node_info(&self, key: &str) -> Option<NodeInfo> {
         let n = self.node_ref(key)?;
@@ -8131,6 +8160,41 @@ impl<F: Fs> GraphDb<F> {
             a.edge_type == b.edge_type && a.src_key == b.src_key && a.dst_key == b.dst_key
         });
         Ok(edges)
+    }
+
+    /// [`node_edges_masked`](Self::node_edges_masked) with the **subject check**
+    /// a scoped caller needs, and a plain [`EdgeInfo`] list.
+    ///
+    /// `node_edges_masked` raises [`GraphError::KeyNotFound`] only when `key` is
+    /// unknown; a key that exists but is hidden still yields its (filtered) edge
+    /// list, which is correct for a full-token client mask and an existence
+    /// oracle for a scoped one. Here a hidden subject answers exactly as an
+    /// absent one does.
+    ///
+    /// Every edge naming a hidden endpoint is dropped, whatever the mask's
+    /// [`MaskMode`](crate::mask::MaskMode): a scoped caller never sees a
+    /// restricted stub, so there is nothing for it to render.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
+    pub fn node_edges_scoped(
+        &self,
+        key: &str,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<EdgeInfo>> {
+        if !mask.contains_node(self, key) {
+            return Err(GraphError::KeyNotFound { key: key.into() });
+        }
+        Ok(self
+            .node_edges_masked(key, mask)?
+            .into_iter()
+            .filter(|e| !e.src_restricted && !e.dst_restricted)
+            .map(|e| EdgeInfo {
+                edge_type: e.edge_type,
+                src_key: e.src_key,
+                dst_key: e.dst_key,
+                derived: e.derived,
+            })
+            .collect())
     }
 
     /// Every directed edge incident on `key`, both directions, every etype.

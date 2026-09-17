@@ -131,6 +131,204 @@ impl NodeMask {
     }
 }
 
+// ── Scope ─────────────────────────────────────────────────────────────────────
+
+// Test-only: counts how many times the `keys` leg was actually rebuilt, as
+// opposed to served from `keys_cache`. Thread-local because the test harness
+// gives each test its own thread, so a parallel test's resolve cannot be
+// mistaken for this one's.
+#[cfg(test)]
+thread_local! {
+    static SCOPE_KEYS_RESOLVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A read scope: what a handle may see, as a descriptor rather than a mask.
+///
+/// A `Scope` names its legs — a role, a namespace, an explicit key allow-list —
+/// and resolves them to a [`NodeMask`] **per read**. It is the live-read
+/// analogue of [`AsOfScope`](crate::db::AsOfScope), and resolves its role leg
+/// through the same [`GraphDb::mask_for_role`], so a role name means one thing
+/// on both.
+///
+/// # Never widens
+///
+/// Present legs are **intersected**; an absent leg contributes nothing. A scope
+/// with no legs at all is refused by [`Scope::new`] rather than treated as
+/// unscoped — an empty scope must never be the accident that widens a caller to
+/// everything.
+///
+/// # Never stale
+///
+/// Resolution happens on every read, not once at construction. The role leg
+/// goes through [`RoleMaskCache`], keyed on `commit_seq`; the `keys` leg is
+/// cached on this `Scope` on the same terms. Either way a read after a write
+/// rebuilds, so a scoped handle held across a write cannot serve the allow-list
+/// it had before — a key created since is visible, a key deleted since is not.
+/// That is a security property, not a freshness nicety.
+///
+/// Mode is hard-coded [`MaskMode::Omit`]. [`MaskMode::Stub`] discloses node
+/// existence and belongs only to full-token client masks.
+pub struct Scope {
+    /// Role legs, intersected. `new` sets at most one; [`Scope::intersect`]
+    /// appends, because two roles cannot be collapsed into one name without
+    /// resolving them against a store.
+    roles: Vec<String>,
+    /// Namespace legs, intersected on the same terms as `roles`.
+    namespaces: Vec<String>,
+    /// The explicit allow-list, already intersected across every scope that
+    /// contributed one: unknown keys resolve to nothing in every leg, so the
+    /// intersection of two key lists is exact as strings.
+    keys: Option<Vec<String>>,
+    /// The `keys` leg resolved, with the commit it was resolved at.
+    ///
+    /// [`NodeMask::from_keys`] is one hash lookup per key, so re-resolving a
+    /// 50,000-key allow-list on every read would make a handle scope slower
+    /// than the per-call `mask=` it replaces — for exactly the caller who needs
+    /// it most. A read at the same `commit_seq` reuses the entry; a read after
+    /// a write rebuilds. Steady-state cost is one integer comparison.
+    keys_cache: Mutex<Option<(u64, NodeMask)>>,
+}
+
+impl Scope {
+    /// Build a scope from the legs that are present.
+    ///
+    /// At least one leg is required: `Scope::new(None, None, None)` is
+    /// [`GraphError::QueryError`](core_storage::GraphError::QueryError), never
+    /// an unscoped handle.
+    ///
+    /// `keys: Some(vec![])` *is* a leg — it narrows to nothing, which is safe.
+    /// An unknown role is not detected here; it surfaces from
+    /// [`Scope::resolve`], which is where a store exists to check it against.
+    pub fn new(
+        role: Option<String>,
+        namespace: Option<String>,
+        keys: Option<Vec<String>>,
+    ) -> Result<Scope> {
+        if role.is_none() && namespace.is_none() && keys.is_none() {
+            return Err(core_storage::GraphError::QueryError {
+                detail: "a scope needs at least one of role, namespace or keys; \
+                         an empty scope is refused rather than read as unscoped"
+                    .into(),
+            });
+        }
+        Ok(Scope {
+            roles: role.into_iter().collect(),
+            namespaces: namespace.into_iter().collect(),
+            keys,
+            keys_cache: Mutex::new(None),
+        })
+    }
+
+    /// Resolve every present leg against `db` and intersect the results.
+    ///
+    /// Returns `Err` when a role leg names no defined role, or when
+    /// `roles.json` was corrupt at open — the same refusals
+    /// [`GraphDb::mask_for_role`] makes, unchanged.
+    pub fn resolve<F: Fs>(&self, db: &GraphDb<F>) -> Result<NodeMask> {
+        let mut out: Option<NodeMask> = None;
+        let mut narrow = |mask: NodeMask| {
+            out = Some(match out.take() {
+                Some(acc) => acc.intersect(&mask),
+                None => mask,
+            });
+        };
+
+        for role in &self.roles {
+            narrow(db.mask_for_role(role)?);
+        }
+        for namespace in &self.namespaces {
+            narrow(db.mask_for_namespace(namespace));
+        }
+        if self.keys.is_some() {
+            narrow(self.resolve_keys(db));
+        }
+
+        // `new` refuses a legless scope, so at least one leg ran.
+        Ok(out
+            .expect("a Scope always has at least one leg")
+            .with_mode(MaskMode::Omit))
+    }
+
+    /// Return a scope seeing only what both `self` and `other` see.
+    ///
+    /// Legs accumulate rather than replace: two role legs are both resolved and
+    /// intersected, and two key lists are intersected as strings. The result
+    /// starts with a cold cache, which costs one rebuild and cannot be wrong.
+    pub fn intersect(&self, other: &Scope) -> Scope {
+        let keys = match (&self.keys, &other.keys) {
+            (Some(a), Some(b)) => {
+                let b: HashSet<&str> = b.iter().map(String::as_str).collect();
+                Some(
+                    a.iter()
+                        .filter(|k| b.contains(k.as_str()))
+                        .cloned()
+                        .collect(),
+                )
+            }
+            (Some(a), None) => Some(a.clone()),
+            (None, b) => b.clone(),
+        };
+        Scope {
+            roles: [self.roles.clone(), other.roles.clone()].concat(),
+            namespaces: [self.namespaces.clone(), other.namespaces.clone()].concat(),
+            keys,
+            keys_cache: Mutex::new(None),
+        }
+    }
+
+    /// The `keys` leg, from the cache when it was resolved at this commit.
+    ///
+    /// Callers check `self.keys.is_some()` first; an absent leg is not a leg
+    /// resolving to the empty mask, which would hide everything.
+    fn resolve_keys<F: Fs>(&self, db: &GraphDb<F>) -> NodeMask {
+        let keys = self.keys.as_deref().unwrap_or_default();
+        let seq = db.commit_seq();
+
+        if let Ok(cache) = self.keys_cache.lock() {
+            if let Some((at, mask)) = cache.as_ref() {
+                if *at == seq {
+                    return mask.clone();
+                }
+            }
+        }
+
+        #[cfg(test)]
+        SCOPE_KEYS_RESOLVES.with(|c| c.set(c.get() + 1));
+        let mask = NodeMask::from_keys(db, keys.iter().map(String::as_str));
+
+        if let Ok(mut cache) = self.keys_cache.lock() {
+            *cache = Some((seq, mask.clone()));
+        }
+        mask
+    }
+}
+
+impl Clone for Scope {
+    /// Carries the resolved `keys` leg across, cache included: it is stamped
+    /// with the commit it was built at, so a clone can serve it only while that
+    /// is still current.
+    fn clone(&self) -> Scope {
+        Scope {
+            roles: self.roles.clone(),
+            namespaces: self.namespaces.clone(),
+            keys: self.keys.clone(),
+            keys_cache: Mutex::new(self.keys_cache.lock().ok().and_then(|cache| cache.clone())),
+        }
+    }
+}
+
+impl std::fmt::Debug for Scope {
+    /// Omits the resolved cache: it is a derived value, and printing a
+    /// 50,000-id mask in a log line helps nobody.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scope")
+            .field("roles", &self.roles)
+            .field("namespaces", &self.namespaces)
+            .field("keys", &self.keys.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
 // ── Role → mask memo ──────────────────────────────────────────────────────────
 
 /// Role → resolved mask, valid for exactly one commit sequence.
@@ -200,6 +398,122 @@ impl RoleMaskCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::roles::RoleDef;
+    use crate::schema::Schema;
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("graphdb-mask-unit-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// A scope with nothing in it is not "unscoped" — it is a mistake, and it
+    /// is refused where it is made rather than where it would have widened.
+    #[test]
+    fn scope_with_no_legs_is_refused() {
+        let err = Scope::new(None, None, None).expect_err("an empty scope must not be built");
+        match err {
+            core_storage::GraphError::QueryError { detail } => {
+                for arg in ["role", "namespace", "keys"] {
+                    assert!(
+                        detail.contains(arg),
+                        "the refusal must name `{arg}`; got {detail:?}"
+                    );
+                }
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    /// Two legs are an intersection, never a union: the key leg cannot hand a
+    /// role a node the role could not already see.
+    #[test]
+    fn scope_legs_intersect_and_never_widen() {
+        let dir = tmp_dir("scope-intersect");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Doc", "a", vec![]).unwrap();
+        db.insert_node("Doc", "b", vec![]).unwrap();
+        db.insert_node("Secret", "c", vec![]).unwrap();
+        db.apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "reader".into(),
+                keys: vec![],
+                labels: vec!["Doc".into()],
+                visible_where: None,
+                namespaces: None,
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let scope = Scope::new(
+            Some("reader".into()),
+            None,
+            Some(vec!["b".into(), "c".into()]),
+        )
+        .unwrap();
+        let mask = scope.resolve(&db).unwrap();
+
+        let b = db.ids().get("b").unwrap();
+        assert_eq!(mask.len(), 1, "only `b` is in both legs");
+        assert!(mask.contains_id(b));
+        assert_eq!(mask.mode(), MaskMode::Omit);
+    }
+
+    /// The key leg is re-resolved, not frozen: a key that names nothing when
+    /// the scope is built is visible once it exists.
+    #[test]
+    fn scope_keys_leg_sees_a_key_created_after_construction() {
+        let dir = tmp_dir("scope-late-key");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Doc", "early", vec![]).unwrap();
+
+        let scope = Scope::new(None, None, Some(vec!["late".into()])).unwrap();
+        assert!(
+            scope.resolve(&db).unwrap().is_empty(),
+            "`late` does not exist yet"
+        );
+
+        db.insert_node("Doc", "late", vec![]).unwrap();
+
+        let mask = scope.resolve(&db).unwrap();
+        let late = db.ids().get("late").unwrap();
+        assert!(
+            mask.contains_id(late),
+            "the key leg must be re-resolved after the write"
+        );
+        assert_eq!(mask.len(), 1);
+    }
+
+    /// Re-resolving a key leg is one hash lookup per key, so it is remembered
+    /// for the commit it was resolved at — and only for that commit.
+    #[test]
+    fn scope_keys_leg_is_cached_within_a_commit() {
+        let dir = tmp_dir("scope-keys-cache");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Doc", "a", vec![]).unwrap();
+
+        let scope = Scope::new(None, None, Some(vec!["a".into()])).unwrap();
+        let before = SCOPE_KEYS_RESOLVES.with(|c| c.get());
+
+        scope.resolve(&db).unwrap();
+        scope.resolve(&db).unwrap();
+        assert_eq!(
+            SCOPE_KEYS_RESOLVES.with(|c| c.get()) - before,
+            1,
+            "two resolves at one commit rebuild the key leg once"
+        );
+
+        db.insert_node("Doc", "b", vec![]).unwrap();
+        scope.resolve(&db).unwrap();
+        assert_eq!(
+            SCOPE_KEYS_RESOLVES.with(|c| c.get()) - before,
+            2,
+            "a write invalidates the cached key leg"
+        );
+    }
 
     #[test]
     fn a_version_change_rebuilds_and_clear_empties() {

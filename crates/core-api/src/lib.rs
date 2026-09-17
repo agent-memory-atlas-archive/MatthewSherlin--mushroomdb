@@ -44,7 +44,7 @@ pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, Hist
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
-pub use mask::{MaskMode, NodeMask, RoleMaskCache};
+pub use mask::{MaskMode, NodeMask, RoleMaskCache, Scope};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
 pub use roles::{PropPredicate, RoleDef, WriteScope};
 pub use schema::{Schema, SchemaDiff};

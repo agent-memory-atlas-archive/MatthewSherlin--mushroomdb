@@ -5,9 +5,9 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use core_api::{
-    json_to_value, schema::Schema, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary,
-    RoleDef, RuleDef, RuleStats, SharedDb, SnapshotOptions, Stats, Value, WriteScope,
-    MERGE_CREATE_NEEDS_ONE_NAMESPACE,
+    json_to_value, schema::Schema, Direction, Explanation, FkSkip, IngestReport, Predicate,
+    PredicateSummary, RoleDef, RuleDef, RuleStats, SharedDb, SnapshotOptions, Stats, Value,
+    ViewDef, ViewSource, WriteScope, MERGE_CREATE_NEEDS_ONE_NAMESPACE,
 };
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
@@ -4301,6 +4301,118 @@ async fn scoped_remove_ns_prop_refused() {
         db.read().namespace_of("n1").as_deref(),
         Some("tenant-a"),
         "the node keeps its namespace"
+    );
+}
+
+/// Build a store whose `AgentNote` nodes carry a view-owned `deg` property.
+///
+/// `n1 -RECALLS-> n2`, so the view backfills `deg = 1` onto `n1` — a stored
+/// property no caller may write or remove.
+fn open_view_prop_db(name: &str, full_token: Option<&str>) -> (Router, SharedDb) {
+    let (app, db) = open_rbac_write(
+        name,
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        full_token,
+        &[("role-tok", "agent")],
+    );
+    {
+        let mut w = db.write();
+        w.create_view(ViewDef {
+            name: "recalls_out".into(),
+            label: "AgentNote".into(),
+            view_prop: "deg".into(),
+            source: ViewSource::Degree {
+                edge_type: "RECALLS".into(),
+                direction: Direction::Out,
+            },
+        })
+        .unwrap();
+        w.insert_node("AgentNote", "n1", vec![("x".into(), Value::Int(1))])
+            .unwrap();
+        w.insert_node("AgentNote", "n2", vec![]).unwrap();
+        w.insert_edge("RECALLS", "n1", "n2").unwrap();
+        assert_eq!(
+            w.get_prop("n1", "deg"),
+            Some(Value::Int(1)),
+            "fixture: the view backfilled a stored property onto n1"
+        );
+    }
+    (app, db)
+}
+
+/// `DELETE /node/{key}/prop/{field}` must not delete a property a view owns.
+///
+/// Same shape as `scoped_remove_ns_prop_refused`: the route reaches
+/// `BatchOp::RemoveProp`, which never meets `GraphDb::remove_prop`'s
+/// `ViewPropReadOnly` guard, so the refusal has to hold at the batch
+/// choke-point — and it has to hold over HTTP, on the role-token branch a
+/// role with update rights can reach.
+#[tokio::test]
+async fn scoped_remove_view_owned_prop_refused() {
+    let (app, db) = open_view_prop_db("t3-rp-view-role", Some("admin"));
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/deg", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "removing a view-owned property must be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    let msg = v["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("managed by view") && msg.contains("recalls_out"),
+        "body must name the owning view: {v}"
+    );
+    assert_eq!(
+        db.read().get_prop("n1", "deg"),
+        Some(Value::Int(1)),
+        "the view-owned property survives the request"
+    );
+}
+
+/// The full-identity branch of the same route submits its own
+/// `BatchOp::RemoveProp`. A guard on only the role branch would leave this one
+/// open, so it is pinned separately.
+#[tokio::test]
+async fn full_token_remove_view_owned_prop_refused() {
+    let (app, db) = open_view_prop_db("t3-rp-view-full", Some("admin"));
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/deg", "admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "removing a view-owned property must be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    let msg = v["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("managed by view") && msg.contains("recalls_out"),
+        "body must name the owning view: {v}"
+    );
+    assert_eq!(
+        db.read().get_prop("n1", "deg"),
+        Some(Value::Int(1)),
+        "the view-owned property survives the request"
+    );
+}
+
+/// The refusal is about the view-owned field, not about the route: an ordinary
+/// property on the same node still deletes over the same endpoint.
+#[tokio::test]
+async fn remove_ordinary_prop_still_works_beside_a_view() {
+    let (app, db) = open_view_prop_db("t3-rp-view-other", Some("admin"));
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/x", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a non-view property still deletes: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(db.read().get_prop("n1", "x"), None, "the property is gone");
+    assert_eq!(
+        db.read().get_prop("n1", "deg"),
+        Some(Value::Int(1)),
+        "and the view-owned one is untouched"
     );
 }
 

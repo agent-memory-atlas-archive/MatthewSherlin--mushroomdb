@@ -328,15 +328,99 @@ fn replace_leaves_edges_alone() {
 
 // ── reserved properties still refuse (spec §5.6) ─────────────────────────────
 
-/// A view owns a stored property, so `replace` cannot make the props "exactly
-/// the supplied ones" — and must say so rather than delete what it does not own.
+/// A view owns a stored property, so `replace` cannot delete it by omitting it
+/// — but it must not refuse the row over it either. The view's property is not
+/// the caller's to supply or to remove, so it is simply not part of what
+/// "exactly the supplied ones" ranges over: `replace` leaves it where it is and
+/// rebuilds everything else.
 ///
-/// The supplied half of that rule was already pinned: passing a view-owned
-/// field is a row error. The *stale* half was not, and a stale field became a
-/// raw `RemoveProp` that never met `remove_prop`'s `ViewPropReadOnly` guard.
+/// Refusing instead would make `replace` impossible for every node a view has
+/// written to, which is the whole population a mirror rebuild has to cover on
+/// any store that carries a view.
 #[test]
-fn replace_will_not_delete_a_view_owned_prop() {
+fn replace_leaves_a_view_owned_prop_in_place() {
     let dir = tmp("viewprop-stale");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(ViewDef {
+        name: "links_out".into(),
+        label: "Doc".into(),
+        view_prop: "deg".into(),
+        source: ViewSource::Degree {
+            edge_type: "LINK".into(),
+            direction: Direction::Out,
+        },
+    })
+    .unwrap();
+    db.insert_node(
+        "Doc",
+        "a",
+        vec![("title".into(), s("one")), ("note".into(), s("stale"))],
+    )
+    .unwrap();
+    db.insert_node("Doc", "b", vec![]).unwrap();
+    db.insert_edge("LINK", "a", "b").unwrap();
+    assert_eq!(
+        db.get_prop("a", "deg"),
+        Some(Value::Int(1)),
+        "fixture: the view backfilled a stored property onto `a`"
+    );
+    assert!(
+        matches!(
+            db.remove_prop("a", "deg"),
+            Err(GraphError::ViewPropReadOnly { .. })
+        ),
+        "fixture: the direct write the stale set would perform is refused"
+    );
+
+    // `deg` is absent from the supplied props, and so is `note`. Only `note` is
+    // the caller's to lose.
+    let out = {
+        let mut b = db.batch();
+        b.insert_node_on_conflict(
+            "Doc",
+            "a",
+            vec![("title".into(), s("two"))],
+            OnConflict::Replace,
+        );
+        b.insert_node_on_conflict("Doc", "z", vec![], OnConflict::Replace);
+        b.commit_outcome().unwrap()
+    };
+
+    assert!(
+        out.row_errors.is_empty(),
+        "the row is not refused: {:?}",
+        out.row_errors
+    );
+    assert_eq!(out.replaced, 1, "the row is performed");
+    assert_eq!(
+        db.get_prop("a", "deg"),
+        Some(Value::Int(1)),
+        "the view-owned property is neither removed nor rewritten"
+    );
+    assert_eq!(
+        db.get_prop("a", "title"),
+        Some(s("two")),
+        "the supplied props land"
+    );
+    assert_eq!(
+        db.get_prop("a", "note"),
+        None,
+        "an ordinary stale prop still goes"
+    );
+    assert!(
+        db.has_node("z"),
+        "the other rows of the frame still committed"
+    );
+}
+
+/// The `RemoveProp` the stale set no longer emits is still refused when a
+/// caller writes it by hand. `BatchOp::RemoveProp` never meets
+/// `GraphDb::remove_prop`'s guard — the refusal lives at the batch choke-point,
+/// which is what `Batch::remove_prop`, the HTTP `DELETE` route and the CLI all
+/// go through.
+#[test]
+fn batch_remove_prop_refuses_a_view_owned_prop() {
+    let dir = tmp("viewprop-batchremove");
     let mut db = GraphDb::open(&dir).unwrap();
     db.create_view(ViewDef {
         name: "links_out".into(),
@@ -352,54 +436,31 @@ fn replace_will_not_delete_a_view_owned_prop() {
         .unwrap();
     db.insert_node("Doc", "b", vec![]).unwrap();
     db.insert_edge("LINK", "a", "b").unwrap();
-    assert_eq!(
-        db.get_prop("a", "deg"),
-        Some(Value::Int(1)),
-        "fixture: the view backfilled a stored property onto `a`"
-    );
-    assert!(
-        matches!(
-            db.remove_prop("a", "deg"),
-            Err(GraphError::ViewPropReadOnly { .. })
-        ),
-        "fixture: the direct write this row would perform is refused"
-    );
+    assert_eq!(db.get_prop("a", "deg"), Some(Value::Int(1)), "fixture");
 
-    // `deg` is absent from the supplied props, so `replace` would remove it.
-    let out = {
+    let err = {
         let mut b = db.batch();
-        b.insert_node_on_conflict(
-            "Doc",
-            "a",
-            vec![("title".into(), s("two"))],
-            OnConflict::Replace,
-        );
-        b.insert_node_on_conflict("Doc", "z", vec![], OnConflict::Replace);
-        b.commit_outcome().unwrap()
+        b.remove_prop("a", "deg");
+        b.commit().unwrap_err()
     };
-
-    assert_eq!(out.replaced, 0, "the row is refused, not performed");
-    assert_eq!(out.row_errors.len(), 1);
-    assert_eq!(out.row_errors[0].0, 0, "the refused row is row 0");
     assert!(
-        out.row_errors[0].1.contains("deg") && out.row_errors[0].1.contains("links_out"),
-        "the row error names the field and its view: {}",
-        out.row_errors[0].1
+        matches!(&err, GraphError::ViewPropReadOnly { view_name } if view_name == "links_out"),
+        "{err:?}"
     );
     assert_eq!(
         db.get_prop("a", "deg"),
         Some(Value::Int(1)),
-        "the view-owned property survives the frame"
+        "the view-owned property survives"
     );
-    assert_eq!(
-        db.get_prop("a", "title"),
-        Some(s("one")),
-        "a refused row changes nothing at all"
-    );
-    assert!(
-        db.has_node("z"),
-        "the other rows of the frame still committed"
-    );
+
+    // The same op on an ordinary field still works, so the guard is about the
+    // field and not about the op.
+    {
+        let mut b = db.batch();
+        b.remove_prop("a", "title");
+        b.commit().unwrap();
+    }
+    assert_eq!(db.get_prop("a", "title"), None);
 }
 
 /// A supplied view-owned field is still the row error it already was, and the

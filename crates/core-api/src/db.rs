@@ -3289,6 +3289,14 @@ impl<F: Fs> GraphDb<F> {
     /// Append a delta the reader cannot apply, so that a corrupt overlay is
     /// reachable from a test.
     ///
+    /// Compiled only under `test-hooks`, which the server's dev-dependency on
+    /// this crate turns on. One call permanently corrupts every
+    /// [`ReaderSnapshot`](crate::reader::ReaderSnapshot) taken from the handle,
+    /// so it must not be in the published surface: `#[doc(hidden)]` hides it
+    /// from rustdoc and from nothing else. The feature gate — not
+    /// `#[cfg(test)]` — because its only callers are in `crates/server/tests`,
+    /// a different crate, exactly as `core_rules`'s index counters are.
+    ///
     /// [`ReaderSnapshot::effective`](crate::reader::ReaderSnapshot) folds the
     /// delta tail into a clone of the frozen overlay and answers
     /// [`GraphError::Corrupt`] when a record will not apply. Nothing a caller
@@ -3303,6 +3311,7 @@ impl<F: Fs> GraphDb<F> {
     /// `commit_seq` does not move, so a role mask already memoised at this
     /// version stays memoised — which is exactly the state in which the HTTP
     /// role branches reach a scoped read with a corrupt overlay under them.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn push_unapplyable_delta_for_test(&mut self) {
         self.delta_tail.push(Arc::new(crate::reader::CommitDelta {
@@ -6116,14 +6125,12 @@ impl<F: Fs> GraphDb<F> {
 
     /// Remove a property. Returns `Ok(false)` (and does not log) if the field
     /// is already absent. Unknown or tombstoned keys are `Err(KeyNotFound)`.
+    /// A field a view owns is `Err(ViewPropReadOnly)` — stated once, in
+    /// [`MutPreview::prepare_remove_prop`], so that the batch ops reaching that
+    /// same choke-point cannot miss it.
     pub fn remove_prop(&mut self, key: &str, field: &str) -> Result<bool> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
-        }
-        if let Some(view_name) = self.view_store.view_for_prop(field) {
-            return Err(GraphError::ViewPropReadOnly {
-                view_name: view_name.to_string(),
-            });
         }
         if !MutPreview::new(self).prepare_remove_prop(key, field)? {
             return Ok(false);
@@ -13122,6 +13129,19 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     }
 
     fn prepare_remove_prop(&self, key: &str, field: &str) -> Result<bool> {
+        // A view owns its property, and the refusal has to live here rather
+        // than on `GraphDb::remove_prop`: `BatchOp::RemoveProp` never meets
+        // that one, and it is what the HTTP `DELETE /node/{key}/prop/{field}`
+        // route, `Batch::remove_prop` and the CLI all submit. This is the one
+        // choke-point every removal passes, exactly as it is for `ns` below.
+        // Checked before the key, so the answer does not depend on whether the
+        // key exists — which is also what `GraphDb::remove_prop` answered when
+        // it carried the only copy of this guard.
+        if let Some(view_name) = self.db.view_store.view_for_prop(field) {
+            return Err(GraphError::ViewPropReadOnly {
+                view_name: view_name.to_string(),
+            });
+        }
         self.check_live_key(key)?;
         // Removing `ns` is changing the namespace — to `default`, the namespace
         // an absent property names. It goes through this one choke-point and NOT
@@ -13316,27 +13336,25 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             .keys()
             .filter(|(k, _)| k == key)
             .map(|(_, field)| field.as_str());
+        //
+        // A view-owned field is filtered out rather than refused. It is not the
+        // caller's to supply (supplying one is still the row error above) and
+        // so it is not part of what "exactly the supplied ones" ranges over:
+        // omitting it is not a request to delete it. Refusing here instead
+        // would make `replace` impossible for every node a view has written to
+        // — which on a store carrying a view is the whole population a mirror
+        // rebuild has to cover.
         let stale: BTreeSet<&str> = store_fields
             .iter()
             .map(String::as_str)
             .chain(overlay_fields)
             .filter(|field| {
-                *field != NS_PROP && !supplied.contains(field) && self.has_prop(key, field)
+                *field != NS_PROP
+                    && !supplied.contains(field)
+                    && self.has_prop(key, field)
+                    && self.db.view_store.view_for_prop(field).is_none()
             })
             .collect();
-        // A stale field becomes a raw `RemoveProp`, which never meets
-        // `GraphDb::remove_prop`'s guard — so the guard is stated here too. A
-        // view owns its property, and `replace` cannot make the props "exactly
-        // the supplied ones" by deleting what it does not own: that is the same
-        // refusal supplying the field gets, from the other direction.
-        for field in &stale {
-            if let Some(view_name) = self.db.view_store.view_for_prop(field) {
-                return Err(format!(
-                    "node {key}: property {field:?} is owned by view {view_name:?} and is \
-                     read-only; on_conflict=\"replace\" cannot remove it by omitting it"
-                ));
-            }
-        }
         writes.extend(stale.into_iter().map(|field| (field.to_string(), None)));
         Ok(writes)
     }

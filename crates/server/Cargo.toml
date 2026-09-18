@@ -33,6 +33,13 @@ include_dir = { version = "0.7", optional = true }
 libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
+# `test-hooks` exposes `GraphDb::push_unapplyable_delta_for_test`, which
+# `tests/http.rs` uses to reach the `Corrupt` arm of the scoped reader on both
+# HTTP role branches. The hook corrupts every snapshot the handle hands out, so
+# it is gated out of the published crate and turned on here only.
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.9", features = [
+    "test-hooks",
+] }
 # oneshot ServiceExt — axum re-exports tower types but not the util trait.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 arrow-ipc = { version = "59", default-features = false }

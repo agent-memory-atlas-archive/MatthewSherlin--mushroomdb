@@ -472,6 +472,25 @@ class GraphDb:
     def disable_index(self, label: str, field: str) -> None:
         """Disable the equality index on `(label, field)`."""
 
+    def enable_multiplicity(self) -> None:
+        """Start recording a per-pair insert count on this store.
+
+        Opt-in, and **one way**: it writes a declaration record the previous
+        release's decoder cannot read. A 0.6.9 binary opening a store that has
+        enabled multiplicity does not refuse it — it treats the first such
+        record as a corrupt WAL tail, replays only the commits before it, and
+        persists that truncation. Every commit after the declaration is lost.
+
+        A store that never calls this contains no such record and stays
+        readable by 0.6.9 indefinitely. Refused on a scoped handle.
+        """
+
+    def is_multiplicity_enabled(self) -> bool:
+        """Whether this store records insert-count multiplicity.
+
+        A store-wide flag naming no node, so it answers on a scoped handle.
+        """
+
     def is_index_enabled(self, label: str, field: str) -> bool:
         """Whether `(label, field)` currently has an equality index."""
 
@@ -569,17 +588,28 @@ class GraphDb:
         """
 
     def degree(
-        self, key: str, edge_type: str | None = None, direction: str = "both"
+        self,
+        key: str,
+        edge_type: str | None = None,
+        direction: str = "both",
+        multiplicity: bool = False,
     ) -> int:
-        """Unique directed degree of `key`.
+        """Unique directed degree of `key`, or its insert count.
 
         `direction` is `"out"`, `"in"` or `"both"` — the sum of unique
         out-neighbours and unique in-neighbours, so a reciprocal pair counts 2
         at each endpoint, not the size of the undirected neighbour set.
 
-        Adjacency is a set, so this is a unique-neighbour count, not a stored
-        counter and not a row count of duplicate pairs. An unknown `edge_type`
-        yields 0; an unknown `key` raises `KeyNotFound`.
+        Adjacency is a set, so the default is a unique-neighbour count, not a
+        row count of duplicate pairs. An unknown `edge_type` yields 0; an
+        unknown `key` raises `KeyNotFound`.
+
+        `multiplicity=True` sums the persisted per-pair insert count instead,
+        so a pair inserted three times contributes 3. It answers the unique
+        count on a store that never called `enable_multiplicity` — the argument
+        is a readout preference, not a demand the store cannot meet. On a scoped
+        handle it sums visible pairs only, for the same reason the unique count
+        does: an unfiltered total discloses hidden neighbours by arithmetic.
         """
 
     def degrees(
@@ -590,6 +620,7 @@ class GraphDb:
         edge_type: str | None = None,
         direction: str = "both",
         limit: int | None = None,
+        multiplicity: bool = False,
     ) -> list[tuple[str, int]]:
         """Unique directed degree for a key subset or a label scan.
 

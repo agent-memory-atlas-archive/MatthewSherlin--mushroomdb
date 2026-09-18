@@ -1,14 +1,25 @@
-"""The leak surface of `db.scoped(...)` — one row of spec §5.3 per test.
+"""The leak surface of `db.scoped(...)` — **every** method reachable on a
+scoped handle has a row here, read or write.
 
-Every test here makes the same assertion in the same way: **the scoped answer
-mentions no key outside the scope.** `_mentions_hidden` walks whatever the
-method returns — dict, list, tuple, string, at any depth — and fails if a
-hidden key appears anywhere in it. A method that silently ignores the scope
-is the defect this release exists to prevent, so this file is deliberately
-uniform and deliberately separate from the per-method test modules.
+Most tests make the same assertion in the same way: the scoped answer mentions
+no key outside the scope. `_mentions_hidden` walks whatever the method returns
+— dict, list, tuple, string, at any depth — and fails if a hidden key appears
+anywhere in it. A method that silently ignores the scope is the defect this
+release exists to prevent, so this file is deliberately uniform and deliberately
+separate from the per-method test modules.
 
-Each test also pins the *unscoped* answer, so a test can never pass because
+Each read test also pins the *unscoped* answer, so a test can never pass because
 the fixture had nothing to leak.
+
+**An error is an output.** The write half of this file exists because defect #8
+was a refusal, not a return value: `upsert_node` read the node through an
+unscoped path *before* reaching the write refusal, so a hidden key raised
+`ValueError` naming its label while an absent key raised `RuntimeError`. The
+exception class alone was a one-call existence oracle. Every write therefore
+asserts that a hidden key and an absent key produce the **same class and the
+same message**, and `test_every_method_has_a_row` fails the suite if a method
+is ever added without a row — a method missing from this file is a method
+nobody checked.
 
 Two rows read differently from the spec's table, and the difference matters:
 
@@ -18,11 +29,14 @@ Two rows read differently from the spec's table, and the difference matters:
   would therefore say "this key exists but you may not see it", which is the
   existence oracle the contract's first sentence forbids. Hidden answers
   exactly as absent does, per method, and that is what is asserted below.
+  (The spec was amended to match: defect #10.)
 - `neighborhood` has no Python binding to scope; `neighbors` is its one-hop
   surface and carries the row.
 """
 
 from __future__ import annotations
+
+import inspect
 
 import pytest
 
@@ -30,6 +44,7 @@ from mushroomdb import GraphDb
 
 HIDDEN = ("hidden_x", "hidden_y")
 VISIBLE = ("vis_a", "vis_b")
+ABSENT = "no_such_key_at_all"
 
 
 def _mentions_hidden(obj) -> list[str]:
@@ -297,3 +312,258 @@ def test_schema_facts_stay_unscoped(store):
     db.enable_index("Person", "team")
     assert s.is_index_enabled("Person", "team") == db.is_index_enabled("Person", "team")
     assert s.has_vector_rule("emb") == db.has_vector_rule("emb")
+
+
+def test_wal_total_commits_is_a_store_fact(store):
+    """Store-wide, like `stats()`'s counts: a frame count names no node."""
+    db, s = store
+    assert s.wal_total_commits() == db.wal_total_commits()
+
+
+def test_refresh_is_permitted_and_names_nothing(store):
+    """A scoped handle may refresh — it writes nothing — and gets a count."""
+    _db, s = store
+    assert s.refresh() == 0
+
+
+def test_scoped_narrows_and_never_widens(store):
+    """`scoped()` on a scoped handle intersects; it cannot reach back out."""
+    _db, s = store
+    narrower = s.scoped(keys=["vis_a", "hidden_x"])
+    _assert_clean("scoped().query", narrower.query("MATCH (n) RETURN key(n) AS k"))
+    assert [r["k"] for r in narrower.query("MATCH (n) RETURN key(n) AS k")] == ["vis_a"]
+    # An unknown key in the leg is not an error — that would be an oracle too.
+    assert s.scoped(keys=[ABSENT]).query("MATCH (n) RETURN key(n) AS k") == []
+
+
+def test_close_is_permitted_on_a_scoped_handle(tmp_path):
+    """Closing is not a write, and the two names share one store."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Person", "vis_a", {})
+    s = db.scoped(keys=list(VISIBLE))
+    s.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        db.node_info("vis_a")
+
+
+def test_context_manager_on_a_scoped_handle(tmp_path):
+    """`__enter__` / `__exit__` are `close()`, so they are permitted too."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Person", "vis_a", {})
+    with db.scoped(keys=list(VISIBLE)) as s:
+        assert s.node_info("vis_a") is not None
+    with pytest.raises(RuntimeError, match="closed"):
+        db.node_info("vis_a")
+
+
+def test_open_carries_no_scope_and_reads_no_other_store(tmp_path):
+    """`open` is a staticmethod: `s.open(p)` is `GraphDb.open(p)`, unscoped.
+
+    It is on a scoped handle only because Python puts every staticmethod on
+    every instance. It touches a different path and says nothing about this
+    store, so it has no scoped contract to leak — that is the row.
+    """
+    db = GraphDb.open(str(tmp_path / "a"))
+    db.insert_node("Person", "hidden_x", {})
+    s = db.scoped(keys=list(VISIBLE))
+    other = s.open(str(tmp_path / "b"))
+    assert other.node_info("hidden_x") is None, "a different store, not this one"
+    other.close()
+    db.close()
+
+
+# ── the write surface: a refusal is an output too ────────────────────────────
+
+
+def test_upsert_node_is_not_an_existence_or_label_oracle(store):
+    """Defect #8: the existence read ran unscoped, in front of the refusal.
+
+    Both calls must be the same class with the same message. Before the fix the
+    hidden key raised `ValueError` naming `'Person'` and the absent key raised
+    `RuntimeError` — the class alone answered "does this key exist".
+    """
+    db, s = store
+    assert db.node_info("hidden_x")["label"] == "Person", "fixture: there is a label to leak"
+
+    with pytest.raises(RuntimeError) as hidden:
+        s.upsert_node("__probe__", "hidden_x", {})
+    with pytest.raises(RuntimeError) as absent:
+        s.upsert_node("__probe__", ABSENT, {})
+
+    assert type(hidden.value) is type(absent.value), (
+        "the exception class is a one-call existence oracle: "
+        f"hidden → {type(hidden.value).__name__}, absent → {type(absent.value).__name__}"
+    )
+    assert str(hidden.value) == str(absent.value), (
+        f"the message discloses the node: {hidden.value}"
+    )
+    _assert_clean("upsert_node refusal", str(hidden.value))
+    assert "Person" not in str(hidden.value), "the refusal named the hidden node's label"
+    assert "scoped" in str(hidden.value)
+
+
+# Every write, called once against a hidden key and once against an absent one.
+# The two calls must be indistinguishable: same class, same message. A write
+# that reads the store before refusing shows up here as a difference.
+_WRITES_BY_KEY = {
+    "insert_node": lambda s, k: s.insert_node("Person", k, {"t": 1}),
+    # A *mismatching* label on purpose: `test_scoped.py` probes with the stored
+    # label, which falls straight through to the write refusal and never runs
+    # the branch defect #8 lived in.
+    "upsert_node": lambda s, k: s.upsert_node("__probe_label__", k, {"t": 1}),
+    "insert_edge": lambda s, k: s.insert_edge("LINKS", "vis_a", k),
+    "delete_edge": lambda s, k: s.delete_edge("LINKS", "vis_a", k),
+    "insert_edge_upsert": lambda s, k: s.insert_edge_upsert("LINKS", "vis_a", k, "Person"),
+    "delete_node": lambda s, k: s.delete_node(k),
+    "set_prop": lambda s, k: s.set_prop(k, "t", 1),
+    "remove_prop": lambda s, k: s.remove_prop(k, "t"),
+    "rename_node": lambda s, k: s.rename_node(k, "__probe__"),
+    "query_write": lambda s, k: s.query_write(
+        "MATCH (n) WHERE key(n) = $k SET n.t = 1 RETURN key(n)", {"k": k}
+    ),
+    "ingest_batch": lambda s, k: s.ingest_batch(
+        [{"key": k, "label": "Person", "props": {"t": 1}}], on_conflict="replace"
+    ),
+    "batch_edges": lambda s, k: s.batch_edges([{"edge_type": "LINKS", "src": "vis_a", "dst": k}]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_WRITES_BY_KEY))
+def test_a_keyed_write_refuses_identically_for_hidden_and_absent(store, name):
+    db, s = store
+    call = _WRITES_BY_KEY[name]
+
+    with pytest.raises(RuntimeError) as hidden:
+        call(s, "hidden_x")
+    with pytest.raises(RuntimeError) as absent:
+        call(s, ABSENT)
+
+    assert type(hidden.value) is type(absent.value), (
+        f"{name}: hidden → {type(hidden.value).__name__}, "
+        f"absent → {type(absent.value).__name__}; the class is an existence oracle"
+    )
+    assert str(hidden.value) == str(absent.value), f"{name} discloses: {hidden.value}"
+    _assert_clean(f"{name} refusal", str(hidden.value))
+    assert "scoped" in str(hidden.value), f"{name}: {hidden.value}"
+
+    # And nothing landed, on either key.
+    assert db.node_info("hidden_x")["props"].get("t") is None
+    assert db.node_info(ABSENT) is None
+    assert db.node_info("__probe__") is None
+
+
+# Writes with no node key to probe. They still must refuse, and refuse before
+# reading anything: the message is the scoped refusal, not a store fact.
+_WRITES_KEYLESS = {
+    "create_rule": lambda s: s.create_rule(
+        {
+            "name": "same_team",
+            "src_label": "Person",
+            "dst_label": "Person",
+            "predicate": {"FieldEqual": {"field": "team"}},
+            "edge_type": "SAME_TEAM",
+            "weight_prop": None,
+        },
+        if_not_exists=True,
+    ),
+    "enable_index": lambda s: s.enable_index("Person", "team"),
+    "disable_index": lambda s: s.disable_index("Person", "team"),
+    "snapshot": lambda s: s.snapshot(),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_WRITES_KEYLESS))
+def test_a_keyless_write_refuses_with_the_scoped_message(store, name):
+    _db, s = store
+    with pytest.raises(RuntimeError, match="scoped") as err:
+        _WRITES_KEYLESS[name](s)
+    _assert_clean(f"{name} refusal", str(err.value))
+
+
+# ── the file is the surface: nothing may be missing from it ──────────────────
+
+# Every public method `GraphDb` exposes, mapped to why it is safe on a scoped
+# handle. Adding a method without adding a row fails the test below — which is
+# the point: defect #8 existed because `upsert_node` had no row here.
+COVERED = {
+    # reads — one row of spec §5.3 each
+    "query": "test_query",
+    "query_with_params": "test_query_with_params",
+    "query_at": "test_query_at",
+    "node_info": "test_node_info",
+    "node_edges": "test_node_edges",
+    "neighbors": "test_neighbors",
+    "explain": "test_explain",
+    "degree": "test_degree",
+    "degrees": "test_degrees",
+    "find_similar": "test_find_similar",
+    "pairwise_similar": "test_pairwise_similar",
+    "search_hybrid": "test_search_hybrid",
+    "was_linked": "test_was_linked",
+    "edges_at": "test_edges_at",
+    "node_history": "test_node_history",
+    "edge_history": "test_edge_history",
+    "what_if_set_prop": "test_what_if_set_prop",
+    "get_edge_prop": "test_get_edge_prop",
+    "stats": "test_stats",
+    # deliberately unscoped, and each says why
+    "has_vector_rule": "test_schema_facts_stay_unscoped",
+    "is_index_enabled": "test_schema_facts_stay_unscoped",
+    "wal_total_commits": "test_wal_total_commits_is_a_store_fact",
+    # permitted non-writes
+    "refresh": "test_refresh_is_permitted_and_names_nothing",
+    "scoped": "test_scoped_narrows_and_never_widens",
+    "close": "test_close_is_permitted_on_a_scoped_handle",
+    "open": "test_open_carries_no_scope_and_reads_no_other_store",
+    # writes — refused, and the refusal discloses nothing
+    "insert_node": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "upsert_node": "test_upsert_node_is_not_an_existence_or_label_oracle",
+    "insert_edge": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "delete_edge": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "insert_edge_upsert": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "delete_node": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "set_prop": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "remove_prop": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "rename_node": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "query_write": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "ingest_batch": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "batch_edges": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "create_rule": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "enable_index": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "disable_index": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "snapshot": "test_a_keyless_write_refuses_with_the_scoped_message",
+}
+
+# `__enter__` / `__exit__` are the context-manager spelling of `close()`, and
+# carry their own row; no other dunder is a surface.
+_DUNDERS = {"__enter__": "test_context_manager_on_a_scoped_handle"}
+
+
+def test_every_method_has_a_row():
+    """A method reachable on a scoped handle that nobody checked is a defect.
+
+    This is the guard the release leans on: `upsert_node` leaked an existence
+    oracle for as long as it did because no row in this file named it.
+    """
+    public = {
+        name
+        for name, attr in inspect.getmembers(GraphDb)
+        if not name.startswith("_") and callable(attr)
+    }
+    missing = public - set(COVERED)
+    assert not missing, (
+        f"GraphDb.{sorted(missing)} is reachable on a scoped handle and has no row "
+        "in test_scope_leaks.py: give it one, and make sure it applies the scope"
+    )
+    stale = set(COVERED) - public
+    assert not stale, f"COVERED names methods that no longer exist: {sorted(stale)}"
+
+    for dunder in _DUNDERS:
+        assert hasattr(GraphDb, dunder), f"{dunder} vanished; its row is now wrong"
+
+
+def test_covered_names_real_tests():
+    """Every row points at a test that exists in this module."""
+    here = {n for n in globals() if n.startswith("test_")}
+    for method, test in sorted({**COVERED, **_DUNDERS}.items()):
+        assert test in here, f"COVERED[{method!r}] names {test!r}, which is not in this file"

@@ -13324,6 +13324,19 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 *field != NS_PROP && !supplied.contains(field) && self.has_prop(key, field)
             })
             .collect();
+        // A stale field becomes a raw `RemoveProp`, which never meets
+        // `GraphDb::remove_prop`'s guard — so the guard is stated here too. A
+        // view owns its property, and `replace` cannot make the props "exactly
+        // the supplied ones" by deleting what it does not own: that is the same
+        // refusal supplying the field gets, from the other direction.
+        for field in &stale {
+            if let Some(view_name) = self.db.view_store.view_for_prop(field) {
+                return Err(format!(
+                    "node {key}: property {field:?} is owned by view {view_name:?} and is \
+                     read-only; on_conflict=\"replace\" cannot remove it by omitting it"
+                ));
+            }
+        }
         writes.extend(stale.into_iter().map(|field| (field.to_string(), None)));
         Ok(writes)
     }

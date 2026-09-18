@@ -135,10 +135,31 @@ impl NodeMask {
 
 /// Identifies one *loaded* store within this process.
 ///
-/// A [`GraphDb`] mints a fresh id when the handle is created and another
-/// whenever it reloads — the same moments at which it installs a fresh
-/// [`RoleMaskCache`], and for the same reason: anything memoised against the
-/// old state must stop matching rather than be trusted to notice.
+/// # Where an id is minted, and where one is not
+///
+/// A [`GraphDb`] mints a fresh id at **two** points, both of which replace the
+/// graph behind the handle:
+///
+/// 1. `GraphDb::new_empty` — the handle is constructed, so there is no earlier
+///    state anything could have memoised against.
+/// 2. `GraphDb::reset_for_reload` — the store is reloaded from disk. This is
+///    the one that matters: `commit_seq` is zeroed and reseeded from
+///    `max(last_change)`, which a delete-only commit leaves where it was, so a
+///    reload can land back on a sequence a caller's [`Scope`] already cached a
+///    mask at.
+///
+/// A fresh [`RoleMaskCache`] is installed at **three** points — those two, plus
+/// `GraphDb::commit_roles`, which rewrites `roles.json` without committing, so
+/// `commit_seq` does not move and a memoised role mask would still match its
+/// version. The counts differ on purpose: `commit_roles` changes what a *role*
+/// name resolves to, and the only memo a `StoreStamp` guards is the `keys` leg
+/// of a [`Scope`], which is dense ids for literal key strings and does not
+/// depend on role definitions at all. Minting there would evict a live entry
+/// for nothing.
+///
+/// Read that as the rule: **the stamp tracks the identity of the graph, the
+/// cache tracks the identity of the answers.** A change that replaces the graph
+/// does both; a change that replaces only role definitions does one.
 ///
 /// Ids come from a process-wide counter and are never reused, so two ids are
 /// equal only when they name the same store at the same load.

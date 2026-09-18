@@ -4,7 +4,7 @@
 //! content without wiping it first. `OnConflict` says what a taken key means:
 //! refuse the frame (today's answer), leave the stored node alone, or make its
 //! properties exactly the supplied ones.
-use core_api::{BatchOp, Direction, GraphDb, GraphError, OnConflict, Value};
+use core_api::{BatchOp, Direction, GraphDb, GraphError, OnConflict, Value, ViewDef, ViewSource};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!(
@@ -324,6 +324,160 @@ fn replace_leaves_edges_alone() {
         db.neighbors("a", "LINK", Direction::Out).unwrap(),
         vec!["b".to_string()]
     );
+}
+
+// ── reserved properties still refuse (spec §5.6) ─────────────────────────────
+
+/// A view owns a stored property, so `replace` cannot make the props "exactly
+/// the supplied ones" — and must say so rather than delete what it does not own.
+///
+/// The supplied half of that rule was already pinned: passing a view-owned
+/// field is a row error. The *stale* half was not, and a stale field became a
+/// raw `RemoveProp` that never met `remove_prop`'s `ViewPropReadOnly` guard.
+#[test]
+fn replace_will_not_delete_a_view_owned_prop() {
+    let dir = tmp("viewprop-stale");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(ViewDef {
+        name: "links_out".into(),
+        label: "Doc".into(),
+        view_prop: "deg".into(),
+        source: ViewSource::Degree {
+            edge_type: "LINK".into(),
+            direction: Direction::Out,
+        },
+    })
+    .unwrap();
+    db.insert_node("Doc", "a", vec![("title".into(), s("one"))])
+        .unwrap();
+    db.insert_node("Doc", "b", vec![]).unwrap();
+    db.insert_edge("LINK", "a", "b").unwrap();
+    assert_eq!(
+        db.get_prop("a", "deg"),
+        Some(Value::Int(1)),
+        "fixture: the view backfilled a stored property onto `a`"
+    );
+    assert!(
+        matches!(
+            db.remove_prop("a", "deg"),
+            Err(GraphError::ViewPropReadOnly { .. })
+        ),
+        "fixture: the direct write this row would perform is refused"
+    );
+
+    // `deg` is absent from the supplied props, so `replace` would remove it.
+    let out = {
+        let mut b = db.batch();
+        b.insert_node_on_conflict(
+            "Doc",
+            "a",
+            vec![("title".into(), s("two"))],
+            OnConflict::Replace,
+        );
+        b.insert_node_on_conflict("Doc", "z", vec![], OnConflict::Replace);
+        b.commit_outcome().unwrap()
+    };
+
+    assert_eq!(out.replaced, 0, "the row is refused, not performed");
+    assert_eq!(out.row_errors.len(), 1);
+    assert_eq!(out.row_errors[0].0, 0, "the refused row is row 0");
+    assert!(
+        out.row_errors[0].1.contains("deg") && out.row_errors[0].1.contains("links_out"),
+        "the row error names the field and its view: {}",
+        out.row_errors[0].1
+    );
+    assert_eq!(
+        db.get_prop("a", "deg"),
+        Some(Value::Int(1)),
+        "the view-owned property survives the frame"
+    );
+    assert_eq!(
+        db.get_prop("a", "title"),
+        Some(s("one")),
+        "a refused row changes nothing at all"
+    );
+    assert!(
+        db.has_node("z"),
+        "the other rows of the frame still committed"
+    );
+}
+
+/// A supplied view-owned field is still the row error it already was, and the
+/// two halves report the same way.
+#[test]
+fn replace_supplying_a_view_owned_prop_is_still_a_row_error() {
+    let dir = tmp("viewprop-supplied");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(ViewDef {
+        name: "links_out".into(),
+        label: "Doc".into(),
+        view_prop: "deg".into(),
+        source: ViewSource::Degree {
+            edge_type: "LINK".into(),
+            direction: Direction::Out,
+        },
+    })
+    .unwrap();
+    db.insert_node("Doc", "a", vec![("title".into(), s("one"))])
+        .unwrap();
+    db.insert_node("Doc", "b", vec![]).unwrap();
+    db.insert_edge("LINK", "a", "b").unwrap();
+
+    let out = {
+        let mut b = db.batch();
+        b.insert_node_on_conflict(
+            "Doc",
+            "a",
+            vec![("title".into(), s("two")), ("deg".into(), Value::Int(99))],
+            OnConflict::Replace,
+        );
+        b.commit_outcome().unwrap()
+    };
+    assert_eq!(out.replaced, 0);
+    assert_eq!(out.row_errors.len(), 1);
+    assert!(
+        out.row_errors[0].1.contains("deg") && out.row_errors[0].1.contains("links_out"),
+        "{}",
+        out.row_errors[0].1
+    );
+    assert_eq!(db.get_prop("a", "deg"), Some(Value::Int(1)));
+    assert_eq!(db.get_prop("a", "title"), Some(s("one")));
+}
+
+/// The refusal is about the *view-owned* field, not about views existing: a
+/// node with no view-owned property replaces normally while a view is live.
+#[test]
+fn replace_still_works_on_a_node_the_view_does_not_cover() {
+    let dir = tmp("viewprop-other-label");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(ViewDef {
+        name: "links_out".into(),
+        label: "Doc".into(),
+        view_prop: "deg".into(),
+        source: ViewSource::Degree {
+            edge_type: "LINK".into(),
+            direction: Direction::Out,
+        },
+    })
+    .unwrap();
+    db.insert_node("Note", "n", vec![("title".into(), s("one"))])
+        .unwrap();
+    assert_eq!(db.get_prop("n", "deg"), None, "fixture: no view prop here");
+
+    let out = {
+        let mut b = db.batch();
+        b.insert_node_on_conflict(
+            "Note",
+            "n",
+            vec![("body".into(), s("two"))],
+            OnConflict::Replace,
+        );
+        b.commit_outcome().unwrap()
+    };
+    assert_eq!(out.replaced, 1, "{:?}", out.row_errors);
+    assert_eq!(out.row_errors.len(), 0);
+    assert_eq!(db.get_prop("n", "title"), None, "stale fields still go");
+    assert_eq!(db.get_prop("n", "body"), Some(s("two")));
 }
 
 // ── the frame stays atomic ───────────────────────────────────────────────────

@@ -202,6 +202,11 @@ impl GraphDb {
     /// ```
     #[pyo3(text_signature = "($self, label, key, props)")]
     fn upsert_node(&self, label: &str, key: &str, props: Bound<'_, PyDict>) -> PyResult<String> {
+        // The existence read below is unscoped, and its refusal names the
+        // stored label — so on a scoped handle it answered "does this key
+        // exist, and what is it" before `with_mut` ever refused the write.
+        // The guard has to come first, exactly as `create_rule`'s does.
+        self.refuse_if_scoped()?;
         let mapped = dict_to_props(&props)?;
         let existing = self.with_ref(|db| Ok(db.node_info(key)))?;
         let Some(info) = existing else {

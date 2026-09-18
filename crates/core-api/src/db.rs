@@ -5773,7 +5773,7 @@ impl<F: Fs> GraphDb<F> {
                 match op {
                     BatchOp::InsertNode { label, key, props } => {
                         node_row += 1;
-                        preview.check_insert_node(&key)?;
+                        preview.check_insert_node(&key, &props)?;
                         preview.note_insert_node(&label, &key, &props);
                         recs.push(WalRecord::InsertNode { label, key, props });
                     }
@@ -5786,7 +5786,17 @@ impl<F: Fs> GraphDb<F> {
                         let row = node_row;
                         node_row += 1;
                         if !preview.has_key(&key) {
-                            // No conflict: an ordinary insert on any policy.
+                            // No conflict: an ordinary insert on any policy —
+                            // except that a supplied view-owned field is the
+                            // same mistake here as on a taken key, and gets the
+                            // same row error rather than a frame error. Without
+                            // this, one op answered one request two ways
+                            // depending on whether the store already had the
+                            // key (defect #19).
+                            if let Some(why) = preview.supplied_view_owned_prop(&key, &props) {
+                                outcome.row_errors.push((row, why));
+                                continue;
+                            }
                             preview.note_insert_node(&label, &key, &props);
                             recs.push(WalRecord::InsertNode { label, key, props });
                             continue;
@@ -5802,7 +5812,8 @@ impl<F: Fs> GraphDb<F> {
                                 }
                                 let fields = store_fields.as_deref().unwrap_or_default();
                                 match preview.plan_replace(&label, &key, &props, fields) {
-                                    Ok(writes) => {
+                                    Ok((writes, kept_view_owned)) => {
+                                        outcome.kept_view_owned += kept_view_owned;
                                         for (field, value) in writes {
                                             match value {
                                                 Some(value) => {
@@ -5907,7 +5918,9 @@ impl<F: Fs> GraphDb<F> {
                         // Rules fire and last-change is updated for each created node.
                         for key in [&src_key, &dst_key] {
                             if !preview.has_key(key) {
-                                preview.check_insert_node(key)?;
+                                // A placeholder endpoint carries no props, so
+                                // the view-owned check has nothing to refuse.
+                                preview.check_insert_node(key, &[])?;
                                 preview.note_insert_node(&placeholder_label, key, &[]);
                                 recs.push(WalRecord::InsertNode {
                                     label: placeholder_label.clone(),
@@ -6065,7 +6078,7 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
-        MutPreview::new(self).check_insert_node(key)?;
+        MutPreview::new(self).check_insert_node(key, &props)?;
         self.log_dense(vec![WalRecord::InsertNode {
             label: label.into(),
             key: key.into(),
@@ -12820,8 +12833,29 @@ pub enum OnConflict {
     /// are removed. A supplied label that differs from the stored one, and a
     /// supplied `ns` that would move the node, are row errors — relabelling is
     /// [`GraphDb::rename_node`], not a side effect of a rebuild.
+    ///
+    /// Two properties are outside "exactly", both because they are not the
+    /// caller's to supply:
+    ///
+    /// - `ns` is immutable, so an omitted `ns` leaves the node where it is
+    ///   rather than moving it to `default`;
+    /// - a property a **view** owns is kept, not removed. Supplying one is a
+    ///   row error, so omitting it cannot be a request to delete it, and
+    ///   refusing the row instead would make `Replace` impossible for the whole
+    ///   population a view has written to. Each such field kept is counted in
+    ///   [`BatchOutcome::kept_view_owned`] — the row is still `replaced` and
+    ///   still raises no row error, so that count is the only signal a caller
+    ///   gets that the stored node carries a field its frame did not describe.
     Replace,
 }
+
+/// What one [`OnConflict::Replace`] row resolves to.
+///
+/// The property writes that make the node exactly the supplied props —
+/// `Some(value)` is a set, `None` a removal — paired with how many view-owned
+/// fields the row kept instead of removing, which is the one way the result is
+/// not exactly the supplied props. See [`MutPreview::plan_replace`].
+type ReplacePlan = (Vec<(String, Option<Value>)>, usize);
 
 /// What one committed batch did.
 ///
@@ -12838,6 +12872,17 @@ pub struct BatchOutcome {
     pub skipped: usize,
     /// Rows whose key was taken and whose policy was [`OnConflict::Replace`].
     pub replaced: usize,
+    /// View-owned properties an [`OnConflict::Replace`] row **kept** although
+    /// the caller did not supply them — counted per field, so one row that
+    /// keeps two contributes two.
+    ///
+    /// This is the one respect in which `Replace` does not make a node's props
+    /// exactly the supplied ones (see [`OnConflict::Replace`]). Those rows
+    /// still count in `replaced` and still raise no `row_errors`, because
+    /// nothing went wrong: a view's property is not the caller's to supply or
+    /// to remove. A mirror rebuild that needs its copy to be byte-exact reads
+    /// this to learn that the store kept fields its frame did not describe.
+    pub kept_view_owned: usize,
     /// `(row, why)` for rows an [`OnConflict::Replace`] refused. `row` counts
     /// node-insert ops in this batch from zero, which for a caller that queues
     /// its nodes in order is the index of the offending node. The rest of the
@@ -13112,7 +13157,32 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         false
     }
 
-    fn check_insert_node(&self, key: &str) -> Result<()> {
+    /// The refusals a node creation makes, in the order it makes them.
+    ///
+    /// A view owns its property, and creating a node that carries one is a
+    /// write to it exactly as `set_prop` is — so it is refused here, at the one
+    /// choke-point `GraphDb::insert_node`, `BatchOp::InsertNode` and the
+    /// no-conflict arm of `BatchOp::InsertNodeOnConflict` all pass through.
+    ///
+    /// Leaving creation exempt was not harmless. The value was stored and
+    /// served: a created node the view has no reason to revisit keeps the
+    /// caller's number for the life of the handle, and the backfill at the next
+    /// open overwrites it — so the store answered `deg = 777` before a restart
+    /// and `deg = 0` after, for a property every other surface calls read-only.
+    /// It also split one op two ways: supplying a view-owned field under
+    /// `OnConflict::Replace` was already a row error on a taken key while the
+    /// same field on a fresh key was accepted.
+    ///
+    /// Checked before the key, like [`MutPreview::prepare_remove_prop`], so the
+    /// answer does not depend on whether the key exists.
+    fn check_insert_node(&self, key: &str, props: &[(String, Value)]) -> Result<()> {
+        for (field, _) in props {
+            if let Some(view_name) = self.db.view_store.view_for_prop(field) {
+                return Err(GraphError::ViewPropReadOnly {
+                    view_name: view_name.to_string(),
+                });
+            }
+        }
         if self.has_key(key) {
             Err(GraphError::DuplicateKey { key: key.into() })
         } else {
@@ -13294,16 +13364,20 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     /// field name the store knows, hoisted by the caller so a frame of N
     /// replaces reads the field list once rather than N times.
     ///
-    /// The two refusals are row errors, not frame errors: a mirror rebuild
-    /// should learn which of its rows disagree with the store without losing
-    /// the rows that agree.
+    /// The second half of the pair is how many view-owned fields this row kept
+    /// rather than removed — the one part of "exactly the supplied props" that
+    /// does not hold, and the caller's only signal that it did not.
+    ///
+    /// The refusals are row errors, not frame errors: a mirror rebuild should
+    /// learn which of its rows disagree with the store without losing the rows
+    /// that agree.
     fn plan_replace(
         &self,
         label: &str,
         key: &str,
         props: &[(String, Value)],
         store_fields: &[String],
-    ) -> std::result::Result<Vec<(String, Option<Value>)>, String> {
+    ) -> std::result::Result<ReplacePlan, String> {
         // A different label is a relabel, and a rebuild does not relabel: that
         // is `rename_node` or an explicit write, never a side effect here.
         let stored = self.label_in_batch(key).unwrap_or_default();
@@ -13333,6 +13407,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             ));
         }
 
+        if let Some(why) = self.supplied_view_owned_prop(key, props) {
+            return Err(why);
+        }
+
         let supplied: BTreeSet<&str> = props.iter().map(|(field, _)| field.as_str()).collect();
         let mut writes = Vec::new();
         for (field, value) in props {
@@ -13340,12 +13418,6 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             // the no-op the dense-rewrite seam would drop anyway.
             if field == NS_PROP {
                 continue;
-            }
-            if let Some(view_name) = self.db.view_store.view_for_prop(field) {
-                return Err(format!(
-                    "node {key}: property {field:?} is owned by view {view_name:?} and is \
-                     read-only"
-                ));
             }
             // Already exactly this value: a rebuild of an unchanged row should
             // cost no WAL record.
@@ -13371,19 +13443,38 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         // would make `replace` impossible for every node a view has written to
         // — which on a store carrying a view is the whole population a mirror
         // rebuild has to cover.
-        let stale: BTreeSet<&str> = store_fields
+        let omitted: BTreeSet<&str> = store_fields
             .iter()
             .map(String::as_str)
             .chain(overlay_fields)
             .filter(|field| {
-                *field != NS_PROP
-                    && !supplied.contains(field)
-                    && self.has_prop(key, field)
-                    && self.db.view_store.view_for_prop(field).is_none()
+                *field != NS_PROP && !supplied.contains(field) && self.has_prop(key, field)
             })
             .collect();
+        // The view-owned half is kept, and counted: the row still commits and
+        // still reports no error, so without this number a mirror rebuild is
+        // told it got exactly what it asked for when it did not (defect #18).
+        let (stale, kept): (Vec<&str>, Vec<&str>) = omitted
+            .into_iter()
+            .partition(|field| self.db.view_store.view_for_prop(field).is_none());
         writes.extend(stale.into_iter().map(|field| (field.to_string(), None)));
-        Ok(writes)
+        Ok((writes, kept.len()))
+    }
+
+    /// The row error a supplied view-owned field earns, or `None`.
+    ///
+    /// Shared by [`MutPreview::plan_replace`] and the no-conflict arm of
+    /// `BatchOp::InsertNodeOnConflict` so that one op answers a supplied
+    /// view-owned field the same way whether or not the key was already taken.
+    fn supplied_view_owned_prop(&self, key: &str, props: &[(String, Value)]) -> Option<String> {
+        props.iter().find_map(|(field, _)| {
+            self.db.view_store.view_for_prop(field).map(|view_name| {
+                format!(
+                    "node {key}: property {field:?} is owned by view {view_name:?} and is \
+                     read-only"
+                )
+            })
+        })
     }
 
     /// The namespace `key` is in as this batch sees it — including a node

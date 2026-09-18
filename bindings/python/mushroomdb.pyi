@@ -439,9 +439,16 @@ class GraphDb:
         that differs from the stored one, and an `ns` that would move the node,
         are row errors under `"replace"`, not silent rewrites.
 
+        Two properties sit outside "exactly", because neither is the caller's
+        to supply: `ns`, which is immutable, and any property a view owns,
+        which is kept rather than removed (supplying one is a row error, so
+        omitting it is not a request to delete it). Each field kept that way is
+        counted in `kept_view_owned`, while the row still counts in `replaced`
+        and raises no row error.
+
         The report is `{inserted, edges_inserted, skipped, replaced,
-        row_errors, rules_created, skipped_fk_fields}`, where `row_errors` is a
-        list of `(index into nodes, why)`.
+        kept_view_owned, row_errors, rules_created, skipped_fk_fields}`, where
+        `row_errors` is a list of `(index into nodes, why)`.
         """
 
     def batch_edges(

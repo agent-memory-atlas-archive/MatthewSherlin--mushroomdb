@@ -1206,6 +1206,16 @@ impl GraphDb {
     ///   `ns` that would move the node between namespaces, and an omitted `ns`
     ///   on a node that is in one, since an absent `ns` names `default`.
     ///
+    /// Two properties sit outside "exactly", because neither is the caller's
+    /// to supply: `ns`, which is immutable, and any property a **view** owns,
+    /// which is kept rather than removed. Supplying a view-owned field is a row
+    /// error, so omitting it cannot be a request to delete it — and refusing
+    /// the row instead would make `"replace"` impossible for every node a view
+    /// has written to. Each field kept that way is counted in
+    /// `kept_view_owned`; the row still counts in `replaced` and raises no row
+    /// error, so that count is the only signal a rebuild gets that the stored
+    /// node carries a field its frame did not describe.
+    ///
     /// The frame stays atomic under every policy: skip and replace are decided
     /// during the batch's own validate pass, so it still applies wholly or not
     /// at all. Rows refused by `replace` change nothing and the rest commits.
@@ -1214,9 +1224,9 @@ impl GraphDb {
     /// is a set, so a duplicate edge is already a silent no-op under every
     /// policy, and these edge dicts carry no properties to replace.
     ///
-    /// Returns a dict matching `IngestReport` shape, plus the two conflict
-    /// counts: `{inserted, edges_inserted, skipped, replaced, row_errors,
-    /// rules_created, skipped_fk_fields}`. `row_errors` is a list of
+    /// Returns a dict matching `IngestReport` shape, plus the conflict counts:
+    /// `{inserted, edges_inserted, skipped, replaced, kept_view_owned,
+    /// row_errors, rules_created, skipped_fk_fields}`. `row_errors` is a list of
     /// `(index into nodes, why)`. `edges_inserted` counts only newly written
     /// edges; duplicate edges that already exist are silent no-ops and are NOT
     /// counted.
@@ -1304,6 +1314,7 @@ impl GraphDb {
         d.set_item("edges_inserted", outcome.edges_inserted)?;
         d.set_item("skipped", outcome.skipped)?;
         d.set_item("replaced", outcome.replaced)?;
+        d.set_item("kept_view_owned", outcome.kept_view_owned)?;
         d.set_item("row_errors", outcome.row_errors)?;
         d.set_item("rules_created", PyList::empty(py))?;
         d.set_item("skipped_fk_fields", PyList::empty(py))?;
@@ -1610,10 +1621,16 @@ impl GraphDb {
         F: FnOnce(&mut Db) -> core_api::Result<T>,
     {
         let mut guard = lock(&self.inner.0)?;
-        let db = guard
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-        f(db).map_err(graph_err)
+        let out = {
+            let db = guard
+                .as_mut()
+                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
+            f(db)
+        };
+        // Release the store before `graph_err`, which takes the GIL. See
+        // [`GraphDb::with_scope`] for the inversion that rule prevents.
+        drop(guard);
+        out.map_err(graph_err)
     }
 
     /// Refuse the call when this handle came from `scoped()`.
@@ -1637,10 +1654,16 @@ impl GraphDb {
         F: FnOnce(&Db) -> core_api::Result<T>,
     {
         let guard = lock(&self.inner.0)?;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-        f(db).map_err(graph_err)
+        let out = {
+            let db = guard
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
+            f(db)
+        };
+        // Release the store before `graph_err`, which takes the GIL. See
+        // [`GraphDb::with_scope`] for the inversion that rule prevents.
+        drop(guard);
+        out.map_err(graph_err)
     }
 
     /// Run a read with this handle's scope resolved for **this** read.
@@ -1650,19 +1673,32 @@ impl GraphDb {
     /// one. Resolution happens inside the lock, against the store the read is
     /// about to run on, which is what keeps the allow-list from going stale
     /// across a write.
+    ///
+    /// **The guard is dropped before any `GraphError` is mapped.** `graph_err`
+    /// calls `Python::attach`, and `find_similar`, `pairwise_similar`, `degree`
+    /// and `degrees` call this from inside `py.allow_threads` — so mapping
+    /// under the guard would take Mutex → GIL, against the GIL → Mutex every
+    /// other `#[pymethods]` fn takes. Both orders on the one `Arc<Inner>` every
+    /// `scoped()` child shares is a hang, not a slow read. Resolution and the
+    /// read therefore share one `map_err` *after* the drop, rather than the
+    /// resolve arm keeping an early return of its own that the next edit could
+    /// forget to move.
     fn with_scope<T, F>(&self, f: F) -> PyResult<T>
     where
         F: FnOnce(&Db, Option<&NodeMask>) -> core_api::Result<T>,
     {
         let guard = lock(&self.inner.0)?;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-        let mask = match &self.scope {
-            Some(scope) => Some(scope.resolve(db).map_err(graph_err)?),
-            None => None,
+        let out = {
+            let db = guard
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
+            match &self.scope {
+                Some(scope) => scope.resolve(db).and_then(|mask| f(db, Some(&mask))),
+                None => f(db, None),
+            }
         };
-        f(db, mask.as_ref()).map_err(graph_err)
+        drop(guard);
+        out.map_err(graph_err)
     }
 
     /// This handle's scope narrowed by a per-call `role=` / `namespace=` pair.

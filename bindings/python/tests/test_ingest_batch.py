@@ -258,6 +258,64 @@ def test_a_bad_edge_still_rejects_a_frame_of_skips(tmp_path):
 # ── the reason the decision has to be O(1) ───────────────────────────────────
 
 
+def test_the_report_carries_the_kept_view_owned_count(tmp_path):
+    """Defect #18. `replace` keeps a view-owned property the caller did not
+    supply while still counting the row as `replaced` with no row error, so the
+    count is a caller's only signal that the stored node is not exactly its
+    frame. A rebuild must be able to read it without a KeyError on a store that
+    happens to carry no view — zero is an answer, an absent key is not.
+
+    The view fixture itself lives in the Rust suite: views are not built from
+    Python, so this pins the surface, not the arithmetic.
+    """
+    db = _open(tmp_path)
+    db.ingest_batch([{"key": "a", "label": "Doc", "props": {"title": "a"}}])
+    report = db.ingest_batch(
+        [{"key": "a", "label": "Doc", "props": {"title": "b"}}],
+        on_conflict="replace",
+    )
+    assert report["replaced"] == 1
+    assert report["kept_view_owned"] == 0
+    db.close()
+
+
+def test_the_docs_state_the_view_exception_the_way_they_state_the_ns_one():
+    """Defect #18. Three statements promised "exactly the supplied props" with
+    the `ns` exception spelled out and the view exception not.
+
+    The docstring and the stub are two of them. Both must *say* that a
+    view-owned property is kept — naming `kept_view_owned` in the report shape
+    is not saying it, which is the whole shape of the original defect: the
+    behaviour was there and the sentence describing it was not.
+    """
+    import importlib.util
+    import pathlib
+
+    # maturin packages the root-level `mushroomdb.pyi` as `__init__.pyi`, so
+    # this reads the stub that actually ships.
+    spec = importlib.util.find_spec("mushroomdb")
+    assert spec is not None and spec.origin is not None
+    stub = (pathlib.Path(spec.origin).parent / "__init__.pyi").read_text()
+    stub_doc = stub.split("def ingest_batch(", 1)[1].split("def batch_edges(", 1)[0]
+
+    doc = GraphDb.ingest_batch.__doc__ or ""
+    for text, where in ((doc, "ingest_batch docstring"), (stub_doc, "packaged __init__.pyi")):
+        assert "exactly" in text, f"{where}: fixture — this is the promise being qualified"
+        # The exception, stated in prose next to the promise.
+        exception = [
+            line
+            for line in text.splitlines()
+            if "view" in line and ("owns" in line or "view-owned" in line)
+        ]
+        assert exception, (
+            f"{where} promises 'exactly the supplied props' without stating that a "
+            "property a view owns is kept rather than removed"
+        )
+        assert "kept" in text, where
+        # And the count that lets a rebuild detect it.
+        assert "kept_view_owned" in text, where
+
+
 def test_reingest_100k_is_linear(tmp_path):
     """A quadratic conflict check would pass every other test in this file and
     be useless at the size that motivated the feature.

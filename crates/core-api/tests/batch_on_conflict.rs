@@ -560,3 +560,150 @@ fn a_bad_edge_still_rejects_a_frame_of_skips() {
     assert!(matches!(err, GraphError::KeyNotFound { .. }), "{err:?}");
     assert!(!db.has_node("b"), "nothing from the frame landed");
 }
+
+// ── #18: the kept view-owned props are counted, not silent ───────────────────
+
+/// `replace` keeps a view-owned property the caller did not supply, and the
+/// row still counts as `replaced` with no row error — so without a count of its
+/// own, a mirror rebuild is told it got exactly what it asked for when it did
+/// not. `kept_view_owned` is that count: fields, not rows, because one row can
+/// keep several.
+#[test]
+fn replace_counts_the_view_owned_props_it_kept() {
+    let dir = tmp("viewprop-counted");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(ViewDef {
+        name: "links_out".into(),
+        label: "Doc".into(),
+        view_prop: "deg".into(),
+        source: ViewSource::Degree {
+            edge_type: "LINK".into(),
+            direction: Direction::Out,
+        },
+    })
+    .unwrap();
+    db.create_view(ViewDef {
+        name: "links_in".into(),
+        label: "Doc".into(),
+        view_prop: "indeg".into(),
+        source: ViewSource::Degree {
+            edge_type: "LINK".into(),
+            direction: Direction::In,
+        },
+    })
+    .unwrap();
+    db.insert_node("Doc", "a", vec![("title".into(), s("one"))])
+        .unwrap();
+    db.insert_node("Doc", "b", vec![("title".into(), s("one"))])
+        .unwrap();
+    db.insert_edge("LINK", "a", "b").unwrap();
+    assert_eq!(
+        (db.get_prop("a", "deg"), db.get_prop("a", "indeg")),
+        (Some(Value::Int(1)), Some(Value::Int(0))),
+        "fixture: both views backfilled stored props onto `a`"
+    );
+
+    let out = {
+        let mut b = db.batch();
+        // Two view-owned fields kept on this one row.
+        b.insert_node_on_conflict(
+            "Doc",
+            "a",
+            vec![("title".into(), s("two"))],
+            OnConflict::Replace,
+        );
+        // One more on the next row, so the count is over the frame.
+        b.insert_node_on_conflict(
+            "Doc",
+            "b",
+            vec![("title".into(), s("two"))],
+            OnConflict::Replace,
+        );
+        b.commit_outcome().unwrap()
+    };
+
+    assert!(out.row_errors.is_empty(), "{:?}", out.row_errors);
+    assert_eq!(out.replaced, 2);
+    assert_eq!(
+        out.kept_view_owned, 4,
+        "two view-owned fields on each of the two rows were kept, and said so"
+    );
+}
+
+/// The count is zero when nothing was kept — it reports the exception, not the
+/// presence of a view.
+#[test]
+fn replace_counts_nothing_when_no_view_owned_prop_was_kept() {
+    let dir = tmp("viewprop-uncounted");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(ViewDef {
+        name: "links_out".into(),
+        label: "Doc".into(),
+        view_prop: "deg".into(),
+        source: ViewSource::Degree {
+            edge_type: "LINK".into(),
+            direction: Direction::Out,
+        },
+    })
+    .unwrap();
+    // A different label, so the view never writes to this node.
+    db.insert_node("Memo", "n", vec![("title".into(), s("one"))])
+        .unwrap();
+
+    let out = {
+        let mut b = db.batch();
+        b.insert_node_on_conflict(
+            "Memo",
+            "n",
+            vec![("title".into(), s("two"))],
+            OnConflict::Replace,
+        );
+        b.commit_outcome().unwrap()
+    };
+    assert_eq!(out.replaced, 1, "{:?}", out.row_errors);
+    assert_eq!(out.kept_view_owned, 0);
+}
+
+// ── #19: creation is guarded the same way removal and update are ─────────────
+
+/// Supplying a view-owned field on a key that is *already taken* is a row
+/// error. On a fresh key the very same op used to accept it and store the
+/// caller's number, so one batch answered the same request two ways depending
+/// on the store's contents. The fresh key now earns the identical row error.
+#[test]
+fn on_conflict_insert_refuses_a_view_owned_prop_on_a_fresh_key() {
+    let dir = tmp("viewprop-fresh-key");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(ViewDef {
+        name: "links_out".into(),
+        label: "Doc".into(),
+        view_prop: "deg".into(),
+        source: ViewSource::Degree {
+            edge_type: "LINK".into(),
+            direction: Direction::Out,
+        },
+    })
+    .unwrap();
+
+    let out = {
+        let mut b = db.batch();
+        b.insert_node_on_conflict(
+            "Doc",
+            "fresh",
+            vec![("deg".into(), Value::Int(555))],
+            OnConflict::Replace,
+        );
+        // A clean row in the same frame still commits, as it does for every
+        // other row error.
+        b.insert_node_on_conflict("Doc", "clean", vec![], OnConflict::Replace);
+        b.commit_outcome().unwrap()
+    };
+    assert_eq!(out.row_errors.len(), 1, "{:?}", out.row_errors);
+    assert!(
+        out.row_errors[0].1.contains("deg") && out.row_errors[0].1.contains("links_out"),
+        "{}",
+        out.row_errors[0].1
+    );
+    assert!(!db.has_node("fresh"), "the refused row wrote nothing");
+    assert!(db.has_node("clean"), "the rest of the frame still commits");
+}

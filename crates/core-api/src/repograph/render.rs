@@ -51,14 +51,31 @@ pub fn sanitize(s: &str) -> String {
 
 /// Whether `c` belongs to one of the three classes [`sanitize`] neutralizes.
 /// The ASCII test comes first and returns, so a plain byte — which is almost
-/// every byte of almost every digest — costs one range check instead of falling
-/// through six `matches!` arms that cannot possibly hit.
+/// every byte of almost every digest — answers in one comparison plus
+/// `is_ascii_control`'s two, instead of falling through six `matches!` arms that
+/// cannot possibly hit.
 ///
 /// 0.6.9 widened this from a bare `is_ascii_control()` to the full class and
-/// paid for it: measured over ~400 KB of representative digest text, the
-/// fall-through form ran **40% slower** than the 0.6.8 predicate it replaced
-/// (588 µs against 420 µs), and `touch` renders digests. Ordering the ASCII case
-/// first brings it to **309 µs — 27% faster than 0.6.8** — for identical output.
+/// paid for it, and `touch` renders digests. Measured by
+/// `cargo run --release -p mushroomdb --example sanitize_bench` over ~400 KB of
+/// representative digest text, median of three on an Apple Silicon laptop:
+///
+/// | form | per pass | vs 0.6.8 |
+/// |---|---|---|
+/// | 0.6.8 `is_ascii_control()` only | ~572 µs | — |
+/// | 0.6.9 full class, no fast path | ~775 µs | **+36%** |
+/// | this, ASCII answered first | ~585 µs | +2% |
+///
+/// So the reorder **removes the 0.6.9 regression**; it does not beat 0.6.8. An
+/// earlier standalone micro-benchmark suggested it did, by a wide margin — that
+/// harness inlined differently from the real crate and flattered the result,
+/// which is why the benchmark now lives in the tree and the numbers above come
+/// from it.
+///
+/// No behavioural test can distinguish the two forms: the `matches!` set's
+/// smallest member is U+0085, so it is disjoint from ASCII, and
+/// `is_ascii_control` is false above U+007F — the reorder is equivalent over
+/// every code point, which `sanitize_bench` asserts before it times anything.
 /// `sanitize_classifies_every_ascii_byte` pins the branch this reordering moves.
 #[inline]
 fn is_shape_forging(c: char) -> bool {

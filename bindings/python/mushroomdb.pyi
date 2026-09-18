@@ -196,8 +196,20 @@ class GraphDb:
     def open(path: str | PathLike[str], read_only: bool = False) -> GraphDb:
         """Open (creating if needed) the database rooted at `path`.
 
-        Raises `MushroomBusy` if another read-write handle is open. Pass
-        `read_only=True` for a handle that never writes and never waits.
+        A read-write handle holds the store's cross-process write lock for as
+        long as it is open, so only one exists at a time across all processes.
+        If another is already open this polls for two seconds and then raises
+        `MushroomBusy` — **at `open`, not at the first write**. Nothing was
+        written, so retrying later is always safe.
+
+        Pass `read_only=True` for a handle that never writes and never takes
+        the lock: it opens immediately even while another process is writing,
+        every mutation raises `ReadOnly`, and `refresh()` still follows the
+        writer's commits.
+
+        The supported multi-process arrangements are in
+        `docs/site/multiprocess.md`. Keep a store several processes open on a
+        local disk: advisory locks over a network filesystem are not supported.
         """
 
     def scoped(
@@ -250,7 +262,18 @@ class GraphDb:
     def upsert_node(
         self, label: str, key: str, props: dict[str, Scalar]
     ) -> Literal["inserted", "updated"]:
-        """Insert `key` if absent, else update changed fields in one WAL commit."""
+        """Insert `key` if absent, otherwise update it in place.
+
+        Returns `"inserted"` or `"updated"`. On update, only the fields present
+        in `props` whose value differs from the stored one are written — fields
+        you do not pass are left untouched, and unchanged fields produce no WAL
+        record, so rules do not re-fire needlessly. Changed fields go in one
+        `set_props` call, so a mid-list refusal leaves the node untouched.
+
+        Raises `ValueError` if `key` already exists under a different label:
+        relabelling a node is not an upsert, and ignoring the mismatch would
+        hide a caller bug.
+        """
 
     def insert_edge(self, edge_type: str, src: str, dst: str) -> bool:
         """Insert a user-owned edge; False if it already existed."""
@@ -258,19 +281,42 @@ class GraphDb:
     def insert_edge_upsert(
         self, edge_type: str, src: str, dst: str, placeholder_label: str
     ) -> dict[str, Any]:
-        """Insert an edge, auto-creating missing endpoints as placeholder nodes."""
+        """Insert an edge, auto-creating any missing endpoint.
+
+        Each missing endpoint is created as a plain node with label
+        `placeholder_label` and no properties. Rules fire and last-change is
+        updated for each auto-created node.
+
+        Returns `{"nodes_created": N, "edge_inserted": bool}`.
+        """
 
     def delete_edge(self, edge_type: str, src: str, dst: str) -> bool:
         """Delete a user-owned edge; raises for a rule-derived edge."""
 
     def delete_node(self, key: str) -> dict[str, int]:
-        """Delete a node and its edges; returns `{manual_edges, derived_edges}`."""
+        """Delete a live node and every edge incident on it.
+
+        Returns `{"manual_edges": N, "derived_edges": M}`, counting the
+        user-inserted and rule-derived edges removed. Raises `KeyNotFound` for
+        an unknown or already-deleted key.
+        """
 
     def set_prop(self, key: str, field: str, value: Scalar | None) -> None:
-        """Set a property; `None` removes the field."""
+        """Set or overwrite a single property.
+
+        `value=None` removes the field, exactly as `remove_prop` does: Python
+        has no distinct "null property" and the store has no null value, so
+        `None` means absent rather than stored-as-null.
+        """
 
     def remove_prop(self, key: str, field: str) -> bool:
-        """Remove a property; False if it was already absent."""
+        """Remove a property.
+
+        `True` if the field was present and removed, `False` if it was already
+        absent. Raises `KeyNotFound` for an unknown or deleted key.
+
+        Removing a field a rule watches retracts the edges that field derived.
+        """
 
     def query(
         self,
@@ -279,19 +325,44 @@ class GraphDb:
         role: str | None = None,
         namespace: str | None = None,
     ) -> list[Row]:
-        """Execute a read query and return one dict per row.
+        """Execute a read query and return one dict per row, keyed by RETURN alias.
 
-        `role` answers as one of the store's roles and `namespace` from one
-        namespace; together they intersect, so neither ever widens the other.
+        Values must be `int`, `float`, `str`, `bool`, `list` or `dict`.
+        Parameters are bound, never interpolated, so string values are safe
+        against injection.
+
+        `role` answers as one of the store's roles (from `roles.json`) and
+        `namespace` from one namespace only. They **intersect** — a namespace
+        can only narrow what a role already allows, so a role bound to
+        `tenant-a` asked for `tenant-b` answers with nothing — and either one
+        makes the call a read, so a write statement raises `MaskedReadOnly`.
+
+        Prefer `scoped()` when the scope belongs to the caller rather than to
+        this one call; these arguments are its per-call form.
         """
 
     def query_with_params(
         self, cypher: str, params: Sequence[tuple[str, Scalar]]
     ) -> list[Row]:
-        """Back-compat alias for `query(cypher, params)` with a tuple list."""
+        """Back-compat alias for `query(cypher, params=[...])` with a tuple list.
+
+        Each element of `params` is a `(name, value)` tuple. Values must be
+        `int`, `float`, `str`, `bool`, or a `list` of those. Prefer `query`,
+        which accepts the same tuple list and a dict besides.
+        """
 
     def query_write(self, cypher: str, params: Params = None) -> list[Row]:
-        """Execute a Cypher write statement (CREATE / SET / DELETE / MERGE)."""
+        """Execute a Cypher write statement.
+
+        CREATE / MATCH…SET / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
+
+        Returns a one-row result dict with keys `created`, `properties_set` and
+        `deleted`, unless the statement carries its own `RETURN` projection, in
+        which case the projected rows are returned instead.
+
+        `params` takes the same shapes as `query`: `None`, a dict, or a list of
+        `(name, value)` tuples.
+        """
 
     def query_at(
         self,
@@ -307,7 +378,14 @@ class GraphDb:
         """
 
     def rename_node(self, old: str, new: str) -> None:
-        """Rename a node's key, preserving its edges and history."""
+        """Rename a node's key.
+
+        The dense id — edges, history, last-change — is unchanged, so nothing
+        the old key was party to is lost.
+
+        Raises `KeyNotFound` if `old` is unknown, or `DuplicateKey` if `new` is
+        already live.
+        """
 
     def create_rule(self, rule: dict[str, Any], if_not_exists: bool = False) -> bool:
         """Register a linking rule; False when `if_not_exists` skips a duplicate.
@@ -316,16 +394,40 @@ class GraphDb:
         """
 
     def explain(self, a: str, b: str) -> list[Row]:
-        """Why are `a` and `b` linked? One dict per derived edge."""
+        """Why are `a` and `b` linked? One dict per derived edge between them.
+
+        Each is `{rule, edge_type, src_key, dst_key, weight, predicate}`.
+        `predicate` is the snake_case summary shape, which `create_rule`
+        accepts verbatim — an explanation round-trips into a new rule.
+
+        On a `scoped()` handle: either endpoint hidden raises `KeyNotFound`,
+        and an explanation whose evidence path crosses a hidden node is omitted
+        entirely rather than redacted.
+        """
 
     def neighbors(self, key: str, edge_type: str, direction: str) -> list[str]:
-        """One-hop neighbour keys along `edge_type` ('out' or 'in')."""
+        """One-hop neighbour keys along `edge_type`.
+
+        `direction` is `"out"` or `"in"`. This API is one directed hop, so
+        `"both"` raises `ValueError` — unlike `degree`, which accepts it.
+        """
 
     def node_info(self, key: str) -> dict[str, Any] | None:
-        """`{key, label, props}` for a live node, or None if absent."""
+        """`{key, label, props}` for a live node, or `None` for an unknown key.
+
+        Contrast `node_edges`, which raises `KeyNotFound` for the same miss.
+        The asymmetry mirrors the Rust API — `Option` versus `Result` — and is
+        deliberate, not a Python invention.
+        """
 
     def node_edges(self, key: str) -> list[Row]:
-        """Edges incident on `key`; raises for an unknown key."""
+        """Edges incident on `key`. Raises `KeyNotFound` for an unknown key.
+
+        Each dict is `{edge_type, src_key, dst_key, derived}`.
+
+        `node_info` answers `None` on the same miss, because Rust returns
+        `Option` there and `Result` here. The asymmetry is the core API.
+        """
 
     def node_history(self, key: str) -> Row:
         """Per-node change history: `{key, history, total_commits, horizon}`.
@@ -338,7 +440,14 @@ class GraphDb:
         """Total number of committed WAL frames visible in the current horizon."""
 
     def edge_history(self, a: str, b: str) -> Row:
-        """Per-edge change history: `{a, b, events, total_commits, horizon}`."""
+        """Per-edge change history between `a` and `b`.
+
+        Returns `{a, b, events, total_commits, horizon}`, where each event is
+        `{edge_type, commit, event, rule}`. `event` is `"Added"` or
+        `"Retracted"`; `rule` is the rule name for a derived edge and `None`
+        for a manually written one; `horizon` is the oldest commit still
+        retained — events before it were pruned and are not in `events`.
+        """
 
     def was_linked(self, a: str, b: str, edge_type: str, at_commit: int) -> bool:
         """Whether `a` and `b` were linked by `edge_type` at or before `at_commit`."""
@@ -367,7 +476,16 @@ class GraphDb:
         """Whether `(label, field)` currently has an equality index."""
 
     def has_vector_rule(self, field: str) -> bool:
-        """Whether an approximate (HNSW) VectorSimilar rule covers `field`."""
+        """Whether an approximate (HNSW) VectorSimilar rule covers `field`.
+
+        A capability probe to call before `find_similar`: `True` means the
+        native ANN index is active and `find_similar` will use it unless you
+        pass `exact=True` or a `where=` predicate; `False` means no such rule
+        covers `field`, so `find_similar` is an O(n) brute-force scan — which
+        is exact by construction.
+
+        Unscoped on a `scoped()` handle: this is a schema fact, not node data.
+        """
 
     def find_similar(
         self,
@@ -380,7 +498,43 @@ class GraphDb:
         where: dict | None = None,
         exact: bool = False,
     ) -> list[tuple[str, float]]:
-        """The `k` nearest nodes to `vector` by cosine similarity on `field`."""
+        """The `k` nearest nodes to `vector` by cosine similarity on `field`.
+
+        Returns `(node_key, similarity)` tuples sorted score-descending, kept
+        when `score >= min`. Scores are cosine similarity in `[-1, 1]`; a
+        distance of `1 - sim` is the caller's conversion — the engine does not
+        speak distance.
+
+        **Which arguments make the answer exact.** `exact=True` and a `where=`
+        predicate each force a GEMM brute-force over the candidate set. A
+        `mask=` allow-list — and a `scoped()` handle — do **not**: they narrow
+        which nodes may be returned without changing which kernel runs, so the
+        answer stays approximate when an HNSW rule covers `field`. Under a mask
+        the beam widens until it has `k` visible hits, so the result is never
+        short while more visible hits exist, but it is still not guaranteed to
+        be the true top `k`. If you need an exhaustive answer over the visible
+        set, pass `exact=True` alongside the mask.
+
+        When no approximate VectorSimilar rule covers `field` (check with
+        `has_vector_rule`), every call is already an exact brute-force scan.
+
+        `label=None` searches every label. `where` is `{"field": …, "eq": …}`
+        or `{"field": …, "in": [...]}` — exactly one of `eq`/`in`; anything
+        else raises `ValueError` before reaching the engine. It uses the
+        property index only when `label` is also set and
+        `enable_index(label, where["field"])` is on; otherwise it is a
+        correct-but-slower scan.
+
+        Candidates are `label ∩ mask ∩ where`, intersected further by the
+        handle's scope. A candidate whose embedding is missing, zero-norm or a
+        different length than the query is skipped; a zero-norm query returns
+        `[]`.
+
+        **`min` defaults to `0.0` here and to `0.8` in the MCP `find_similar`
+        tool.** The same operation under the same name returns different
+        results across the two surfaces and neither raises, so pass `min`
+        explicitly if the call is ported between them.
+        """
 
     def pairwise_similar(
         self,
@@ -389,12 +543,44 @@ class GraphDb:
         k: int = 10,
         min: float = 0.0,
     ) -> list[tuple[str, list[tuple[str, float]]]]:
-        """Exact per-key cosine top-k among `keys`. Self excluded. No HNSW."""
+        """Exact per-key cosine top-k among `keys`. Self excluded. Never HNSW.
+
+        Each key in `keys` is scored only against that same set, so this is a
+        closed comparison, not a search of the store. Writes no edges.
+
+        Scores are cosine similarity in `[-1, 1]`, kept when `score >= min` —
+        the same unit and inequality as `find_similar`. A distance of
+        `1 - sim` is the caller's conversion here too; convert after the call
+        rather than baking a distance threshold into `min`.
+
+        Treat the result as a map keyed by source: outer order is first-seen
+        packed keys, not a zip with the input. A source with no neighbour above
+        `min` still appears as `(src, [])`, so "present, nothing similar" stays
+        distinct from "omitted".
+
+        Unknown keys, missing embeddings, zero-norm and wrong-dimension vectors
+        are omitted as both query and candidate. Duplicate keys collapse to
+        first-seen order. Empty `keys` returns `[]`. More than 8192 unique
+        resolved keys raises.
+
+        On a `scoped()` handle hidden keys are dropped from the input set
+        *before* the matmul, so a hidden vector can neither influence a score
+        nor appear as a neighbour.
+        """
 
     def degree(
         self, key: str, edge_type: str | None = None, direction: str = "both"
     ) -> int:
-        """Unique directed degree of `key`. `direction` is out, in, or both (sum)."""
+        """Unique directed degree of `key`.
+
+        `direction` is `"out"`, `"in"` or `"both"` — the sum of unique
+        out-neighbours and unique in-neighbours, so a reciprocal pair counts 2
+        at each endpoint, not the size of the undirected neighbour set.
+
+        Adjacency is a set, so this is a unique-neighbour count, not a stored
+        counter and not a row count of duplicate pairs. An unknown `edge_type`
+        yields 0; an unknown `key` raises `KeyNotFound`.
+        """
 
     def degrees(
         self,
@@ -405,7 +591,15 @@ class GraphDb:
         direction: str = "both",
         limit: int | None = None,
     ) -> list[tuple[str, int]]:
-        """Unique directed degree for a subset or label scan. Unknown keys omitted."""
+        """Unique directed degree for a key subset or a label scan.
+
+        The universe is `keys` if given, else `label`, else every live node.
+        `where` is the same dict shape as `find_similar` and intersects.
+        `limit` applies after sorting degree descending, key ascending.
+
+        Unknown keys are omitted rather than raising, and `keys=[]` returns
+        `[]` — the contrast with `degree`, which raises for an unknown key.
+        """
 
     def search_hybrid(
         self,
@@ -416,12 +610,36 @@ class GraphDb:
         label: str | None = None,
         k: int = 10,
     ) -> list[tuple[str, float]]:
-        """Reciprocal-rank fusion over fulltext and vector similarity."""
+        """Reciprocal-rank fusion over fulltext and vector similarity.
+
+        Fuses up to `4*k` fulltext hits on `text_field` for `query_text` with
+        up to `4*k` vector hits on `vector_field` for `vector`, using
+        Reciprocal Rank Fusion (constant 60). An empty `vector` skips the
+        vector leg and answers from the text leg alone.
+
+        Returns `[(node_key, fused_score)]` sorted score-descending, ties by
+        key. The fused score is a rank-fusion number, not a similarity: it is
+        not comparable with a `find_similar` score.
+
+        **This call takes no exactness argument**, so its vector leg is the
+        approximate one whenever an HNSW rule covers `vector_field`. To fuse an
+        exact vector leg, run `find_similar(..., exact=True)` yourself and fuse
+        it with a text search at the call site.
+
+        On a `scoped()` handle both legs are filtered *before* fusion, so the
+        ranks are the ranks of the visible corpus and `k` is honoured.
+        """
 
     def get_edge_prop(
         self, edge_type: str, src_key: str, dst_key: str, field: str
     ) -> Any | None:
-        """Read a single property from an edge, or None if absent."""
+        """Read a single property from an edge — a rule's `score` weight, say.
+
+        `None` when the edge does not exist, when the field is absent, or when
+        any key cannot be resolved. The three are not distinguished, which is
+        also what makes this safe on a `scoped()` handle: a hidden endpoint
+        answers as an unresolvable key does.
+        """
 
     def ingest_batch(
         self,
@@ -446,9 +664,19 @@ class GraphDb:
         counted in `kept_view_owned`, while the row still counts in `replaced`
         and raises no row error.
 
+        Edges take the argument too, but it changes nothing for them:
+        adjacency is a set, so a duplicate edge is already a silent no-op under
+        every policy, and these edge dicts carry no properties to replace.
+
         The report is `{inserted, edges_inserted, skipped, replaced,
         kept_view_owned, row_errors, rules_created, skipped_fk_fields}`, where
-        `row_errors` is a list of `(index into nodes, why)`.
+        `row_errors` is a list of `(index into nodes, why)`. `edges_inserted`
+        counts only newly written edges; a duplicate edge is a silent no-op and
+        is not counted.
+
+        For large datasets keep each call to 10,000 nodes or fewer. One call
+        with 100,000+ nodes serialises a single giant WAL frame whose fsync
+        dominates and negates the batching. Chunk at the call site.
         """
 
     def batch_edges(
@@ -456,10 +684,27 @@ class GraphDb:
         inserts: Sequence[dict[str, str]] | None = None,
         deletes: Sequence[dict[str, str]] | None = None,
     ) -> dict[str, int]:
-        """Atomically apply edge inserts and deletes in a single WAL commit."""
+        """Atomically apply edge inserts and deletes in a single WAL commit.
+
+        `inserts` and `deletes` are each a list of `{edge_type, src, dst}`
+        dicts naming user-owned edges. All of them commit in one fsync, which
+        is what this API is for: the maintenance pattern where one property
+        update causes many retractions and additions would otherwise serialise
+        one WAL fsync per `insert_edge` / `delete_edge` call.
+
+        Returns `{"edges_inserted": N, "edges_deleted": M}`.
+        """
 
     def stats(self) -> dict[str, Any]:
-        """Node/edge counts, `history_floor`, `namespaces`, and per-rule size, latch, and fires."""
+        """Node and edge counts, `history_floor`, `namespaces`, and per-rule figures.
+
+        `namespaces` lists every namespace with at least one live node and its
+        count. Each rule reports its provenance size, trip latch and fire
+        counter. The shape matches the HTTP `/stats` JSON response.
+
+        On a `scoped()` handle the counts stay store-wide; only the namespace
+        roster narrows to the scope.
+        """
 
     def roles(self) -> list[dict[str, Any]]:
         """The roles `roles.json` defines: `name`, `labels`, `keys`, `namespaces`, `visible_where`.
@@ -475,7 +720,17 @@ class GraphDb:
         """
 
     def snapshot(self) -> None:
-        """Write a durable snapshot and truncate the WAL tail."""
+        """Write a durable snapshot and truncate the WAL tail.
+
+        The next `GraphDb.open()` on the same path then loads the snapshot
+        directly and skips WAL replay, which is what makes reopening a large
+        store quick.
+
+        A snapshot needs the store's write lock, because it replaces the WAL a
+        peer may be appending to. A handle that does not hold the lock raises
+        `MushroomBusy` rather than snapshotting around another process's
+        not-yet-durable bytes.
+        """
 
     @staticmethod
     def restore(src: str | PathLike[str], dst: str | PathLike[str]) -> dict[str, Any]:
@@ -499,8 +754,20 @@ class GraphDb:
     def refresh(self) -> int:
         """Apply other processes' commits; return how many were applied.
 
+        A handle does not poll the store, so another process's writes stay
+        invisible until you call this. Rules fire and derived edges appear
+        exactly as they would on a fresh open.
+
         Writes nothing, so a `read_only=True` handle and a `scoped()` one may
         both call it.
+
+        A commit another process is still writing is left for the next call: a
+        partial trailing frame is a wait, not an error, and the return value
+        counts only the complete frames applied.
+
+        A refresh that finds nothing new costs two filesystem metadata calls
+        and an integer compare — it reads no file contents at all — so polling
+        on an interval is cheap. See `docs/site/multiprocess.md`.
         """
 
     def close(self) -> None:

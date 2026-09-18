@@ -94,6 +94,13 @@ scan_grep_files() {
 scan_claim_files
 scan_grep_files
 
+# The stub-docstring drift check. Separate script, one gate: a caller reading a
+# thinner contract than the binding carries is the same class of defect as a
+# retired claim, and CI already runs this one script.
+if ! bash "$ROOT/scripts/check-pyi.sh"; then
+  fail=1
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "check-claims.sh: FAILED — see the lines above" >&2
   exit 1

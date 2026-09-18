@@ -20,6 +20,7 @@ SITE_DOCS=(
     quickstart.md
     code-graph.md
     concurrency.md
+    multiprocess.md
     rules.md
     mcp.md
     association-bench.md

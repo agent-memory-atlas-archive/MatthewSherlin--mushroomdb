@@ -7,6 +7,90 @@ restricted nodes are presented to callers.
 
 ---
 
+## `scoped()`: one front door for visibility
+
+Six things in this API can narrow what a caller sees. That is a lot to hold in
+mind, and they are not six ideas — they are one idea with five entry points and
+one that is not about the caller at all.
+
+**Start with `scoped()`.** It binds a scope to a *handle* rather than to a call,
+which is almost always what you want: a caller is scoped for as long as it is
+that caller, not one query at a time.
+
+```python
+reader = db.scoped(role="reader-a")
+tenant = db.scoped(namespace="tenant-a", keys=visible_ids)
+```
+
+A scoped handle shares the parent's store and mutex — not a second open, no
+second lock, one small allocation. It refuses every write. Legs intersect, so
+`scoped()` on a scoped handle narrows further and can never widen, and an
+unknown `role` raises at `scoped()` rather than on some later read.
+
+Every read on it obeys one contract:
+
+> **The subject is checked first. A key outside the scope is indistinguishable
+> from a key that does not exist. Then every other node the answer would
+> mention — neighbour, endpoint, candidate, evidence — is filtered to the
+> scope.**
+
+So `node_info` answers `None`, `node_edges` raises `KeyNotFound`, `degree`
+counts only visible neighbours, and `find_similar` scores only visible
+candidates. **Hidden is absent**, never "hidden": a scoped caller cannot tell a
+key it may not see from a key nobody has.
+
+### The others are its legs
+
+| | What it is | `scoped()` form |
+|---|---|---|
+| `role=` | A named role from `roles.json` — its labels, keys, namespaces and `visible_where`, resolved to an allow-list | `scoped(role=…)` |
+| `namespace=` | One namespace | `scoped(namespace=…)` |
+| `mask=` | An explicit allow-list of node keys, for one call | `scoped(keys=…)` |
+| `visible_where` | How a *role* carries a property test, in `roles.json` | (inside `role=`) |
+| `where=` | **Not a scope.** A predicate on the data | — |
+
+`role=`, `namespace=` and `mask=` still exist as per-call arguments and are not
+going anywhere — they are the right tool when the narrowing genuinely belongs to
+one call, and the HTTP and MCP surfaces have no handle to bind to, so they are
+the only form there. Reach for the per-call argument when the scope changes per
+call; reach for `scoped()` when it changes per caller.
+
+Nothing here is deprecated. The rule going forward is simply that **no new
+per-call scoping argument gets added** — a seventh way to say "who may see
+what" would cost more in comprehension than it could buy.
+
+### `where=` is a predicate on the data, not on the caller
+
+This is the one most often mistaken for a scope, and the mistake is easy to make
+because `where=` takes the same `{field, eq}` / `{field, in}` shape that a
+role's `visible_where` does.
+
+The difference is what it is attached to:
+
+- **`visible_where`** lives in `roles.json`, beside a role's labels. It is part
+  of *who the caller is*. The caller cannot change it, cannot widen it, and
+  does not pass it.
+- **`where=`** is an argument the caller passes to `find_similar`, `degrees` or
+  `query`. It is part of *what this call is asking for*. The caller chooses it
+  freely, and a caller who omits it gets everything the scope allows.
+
+A `where=` predicate therefore restricts nothing about access. It filters a
+result set the caller was already entitled to see. Two consequences worth being
+explicit about:
+
+- **Do not use `where=` as an access control.** On the MCP path in particular,
+  the caller supplies its own arguments; a predicate it chose is not a boundary
+  it is held to.
+- **A `where=` that narrows the answer to nothing is not a permission failure.**
+  It means no visible node satisfies the predicate.
+
+They do compose. A scoped handle plus a `where=` argument intersects: the scope
+decides what is visible, the predicate filters within it. On `find_similar`,
+`where=` also changes the kernel — it implies an exact search, which `mask=`
+alone does not. See [api.md](api.md#vector-search).
+
+---
+
 ## Role-bound tokens
 
 A role token is a bearer credential tied to a named role whose label selectors are

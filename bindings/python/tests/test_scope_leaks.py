@@ -208,12 +208,44 @@ def test_degree(store):
         s.degree("hidden_x")
 
 
+def test_degree_multiplicity_counts_visible_pairs_only(store):
+    """A multiplicity count discloses more than a unique one, so it is filtered
+    at least as hard: not only that a hidden neighbour exists, but how often it
+    was written."""
+    db, s = store
+    db.enable_multiplicity()
+    # `vis_a → hidden_x` written three more times; `vis_a → vis_b` once more.
+    for _ in range(3):
+        db.insert_edge("LINKS", "vis_a", "hidden_x")
+    db.insert_edge("LINKS", "vis_a", "vis_b")
+
+    assert db.degree("vis_a", edge_type="LINKS", direction="out", multiplicity=True) == 6
+    assert s.degree("vis_a", edge_type="LINKS", direction="out", multiplicity=True) == 2, (
+        "the hidden neighbour's four inserts are outside the scope"
+    )
+    # The unique reading is unchanged by the preference.
+    assert s.degree("vis_a", edge_type="LINKS", direction="out") == 1
+    with pytest.raises(RuntimeError):
+        s.degree("hidden_x", multiplicity=True)
+
+
 def test_degrees(store):
     db, s = store
     assert _mentions_hidden(db.degrees(label="Person"))
     got = s.degrees(label="Person")
     _assert_clean("degrees", got)
     assert sorted(k for k, _ in got) == list(VISIBLE)
+
+
+def test_degrees_multiplicity_filters_both_sides(store):
+    db, s = store
+    db.enable_multiplicity()
+    for _ in range(3):
+        db.insert_edge("LINKS", "vis_a", "hidden_x")
+    got = s.degrees(label="Person", edge_type="LINKS", direction="out", multiplicity=True)
+    _assert_clean("degrees(multiplicity=True)", got)
+    assert sorted(k for k, _ in got) == list(VISIBLE)
+    assert dict(got)["vis_a"] == 1, "only the visible pair is in the sum"
 
 
 def test_find_similar(store):
@@ -307,11 +339,16 @@ def test_stats(store):
 
 
 def test_schema_facts_stay_unscoped(store):
-    """`has_vector_rule` and `is_index_enabled` are schema, not node data."""
+    """`has_vector_rule`, `is_index_enabled` and `is_multiplicity_enabled` are
+    schema, not node data."""
     db, s = store
     db.enable_index("Person", "team")
     assert s.is_index_enabled("Person", "team") == db.is_index_enabled("Person", "team")
     assert s.has_vector_rule("emb") == db.has_vector_rule("emb")
+    # A store-wide flag names no node, so a scoped handle reads it unchanged.
+    assert s.is_multiplicity_enabled() == db.is_multiplicity_enabled()
+    db.enable_multiplicity()
+    assert s.is_multiplicity_enabled() is True
 
 
 def test_roles_is_refused_on_a_scoped_handle(store):
@@ -514,6 +551,7 @@ _WRITES_KEYLESS = {
     ),
     "enable_index": lambda s: s.enable_index("Person", "team"),
     "disable_index": lambda s: s.disable_index("Person", "team"),
+    "enable_multiplicity": lambda s: s.enable_multiplicity(),
     "snapshot": lambda s: s.snapshot(),
 }
 
@@ -555,6 +593,7 @@ COVERED = {
     # deliberately unscoped, and each says why
     "has_vector_rule": "test_schema_facts_stay_unscoped",
     "is_index_enabled": "test_schema_facts_stay_unscoped",
+    "is_multiplicity_enabled": "test_schema_facts_stay_unscoped",
     "wal_total_commits": "test_wal_total_commits_is_a_store_fact",
     # refused outright: schema made of node data, with no honest narrowing
     "roles": "test_roles_is_refused_on_a_scoped_handle",
@@ -580,6 +619,7 @@ COVERED = {
     "create_rule": "test_a_keyless_write_refuses_with_the_scoped_message",
     "enable_index": "test_a_keyless_write_refuses_with_the_scoped_message",
     "disable_index": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "enable_multiplicity": "test_a_keyless_write_refuses_with_the_scoped_message",
     "snapshot": "test_a_keyless_write_refuses_with_the_scoped_message",
 }
 

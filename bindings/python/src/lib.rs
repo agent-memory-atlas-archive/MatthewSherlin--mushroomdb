@@ -783,10 +783,17 @@ impl GraphDb {
 
     /// Unique directed degree of `key`. `direction` is `"out"`, `"in"`, or
     /// `"both"` (out + in sum). Unknown `edge_type` is 0. Unknown key raises.
+    ///
+    /// `multiplicity=True` sums each pair's insert count instead of counting
+    /// each pair once. It defaults to `False`, so an existing caller keeps
+    /// unique-neighbour semantics, and it never raises: on a store that has not
+    /// called `enable_multiplicity()` every pair counts 1, which returns the
+    /// unique degree. The argument is a readout preference, not a demand the
+    /// store has to be able to meet.
     #[allow(deprecated)]
     #[pyo3(
-        signature = (key, edge_type = None, direction = "both"),
-        text_signature = "($self, key, edge_type=None, direction='both')"
+        signature = (key, edge_type = None, direction = "both", multiplicity = false),
+        text_signature = "($self, key, edge_type=None, direction='both', multiplicity=False)"
     )]
     fn degree(
         &self,
@@ -794,16 +801,23 @@ impl GraphDb {
         key: &str,
         edge_type: Option<&str>,
         direction: &str,
+        multiplicity: bool,
     ) -> PyResult<u64> {
         let dir = parse_algo_dir(direction)?;
         let key = key.to_owned();
         let edge_type = edge_type.map(str::to_owned);
         py.allow_threads(|| {
-            self.with_scope(|db, mask| match mask {
+            self.with_scope(|db, mask| match (mask, multiplicity) {
                 // Counting hidden neighbours would disclose their existence by
-                // arithmetic — the same leak the edge filter prevents.
-                Some(mask) => db.degree_scoped(&key, edge_type.as_deref(), dir, mask),
-                None => db.degree(&key, edge_type.as_deref(), dir),
+                // arithmetic — the same leak the edge filter prevents, and a
+                // multiplicity count discloses more: not only that a hidden
+                // neighbour exists but how often it was written.
+                (Some(mask), true) => {
+                    db.degree_scoped_multiplicity(&key, edge_type.as_deref(), dir, mask)
+                }
+                (Some(mask), false) => db.degree_scoped(&key, edge_type.as_deref(), dir, mask),
+                (None, true) => db.degree_multiplicity(&key, edge_type.as_deref(), dir),
+                (None, false) => db.degree(&key, edge_type.as_deref(), dir),
             })
         })
     }
@@ -813,11 +827,16 @@ impl GraphDb {
     /// Unknown keys are omitted. `keys=[]` returns `[]`. `where` is the same
     /// dict shape as `find_similar`. `limit` applies after sorting degree
     /// descending, key ascending.
+    ///
+    /// `multiplicity=True` reports each row's insert-count sum rather than its
+    /// unique neighbour count, with the same default and the same no-raise
+    /// contract `degree` documents. The sort and `limit` then run over the
+    /// counts that reading produces.
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[pyo3(
-        signature = (keys = None, label = None, r#where = None, edge_type = None, direction = "both", limit = None),
-        text_signature = "($self, keys=None, label=None, where=None, edge_type=None, direction='both', limit=None)"
+        signature = (keys = None, label = None, r#where = None, edge_type = None, direction = "both", limit = None, multiplicity = false),
+        text_signature = "($self, keys=None, label=None, where=None, edge_type=None, direction='both', limit=None, multiplicity=False)"
     )]
     fn degrees(
         &self,
@@ -828,6 +847,7 @@ impl GraphDb {
         edge_type: Option<&str>,
         direction: &str,
         limit: Option<usize>,
+        multiplicity: bool,
     ) -> PyResult<Vec<(String, u64)>> {
         let dir = parse_algo_dir(direction)?;
         let pred = match r#where {
@@ -837,11 +857,11 @@ impl GraphDb {
         let label = label.map(str::to_owned);
         let edge_type = edge_type.map(str::to_owned);
         py.allow_threads(|| {
-            self.with_scope(|db, mask| match mask {
+            self.with_scope(|db, mask| match (mask, multiplicity) {
                 // Hidden keys leave both sides: the input — whether they
                 // arrived in `keys` or came out of the label/`where` scan — and
                 // every row's count.
-                Some(mask) => db.degrees_scoped(
+                (Some(mask), true) => db.degrees_scoped_multiplicity(
                     keys.as_deref(),
                     label.as_deref(),
                     pred.as_ref(),
@@ -850,7 +870,24 @@ impl GraphDb {
                     limit,
                     mask,
                 ),
-                None => db.degrees(
+                (Some(mask), false) => db.degrees_scoped(
+                    keys.as_deref(),
+                    label.as_deref(),
+                    pred.as_ref(),
+                    edge_type.as_deref(),
+                    dir,
+                    limit,
+                    mask,
+                ),
+                (None, true) => db.degrees_multiplicity(
+                    keys.as_deref(),
+                    label.as_deref(),
+                    pred.as_ref(),
+                    edge_type.as_deref(),
+                    dir,
+                    limit,
+                ),
+                (None, false) => db.degrees(
                     keys.as_deref(),
                     label.as_deref(),
                     pred.as_ref(),
@@ -930,6 +967,30 @@ impl GraphDb {
     #[pyo3(text_signature = "($self, label, field)")]
     fn is_index_enabled(&self, label: &str, field: &str) -> PyResult<bool> {
         self.with_ref(|db| Ok(db.is_index_enabled(label, field)))
+    }
+
+    /// Start recording insert-count multiplicity on this store.
+    ///
+    /// Adjacency stays a set: a duplicate `insert_edge` still returns `False`
+    /// and `degree()` is unchanged. What it gains is that the duplicate is
+    /// counted, readable as `degree(..., multiplicity=True)` and as the reserved
+    /// `count` edge property.
+    ///
+    /// **This is a one-way step and there is no call that undoes it.** The count
+    /// is durable, so it is written to the write-ahead log as a record no
+    /// release before this one knows how to read; a store that has recorded one
+    /// can no longer be read whole by an older binary. A store that never calls
+    /// this writes no such record and stays readable. Calling it twice writes
+    /// nothing the second time.
+    #[pyo3(text_signature = "($self)")]
+    fn enable_multiplicity(&self) -> PyResult<()> {
+        self.with_mut(|db| db.enable_multiplicity())
+    }
+
+    /// Whether this store records insert-count multiplicity.
+    #[pyo3(text_signature = "($self)")]
+    fn is_multiplicity_enabled(&self) -> PyResult<bool> {
+        self.with_ref(|db| Ok(db.is_multiplicity_enabled()))
     }
 
     /// Whether `a` and `b` were linked by `edge_type` at or before `at_commit`.

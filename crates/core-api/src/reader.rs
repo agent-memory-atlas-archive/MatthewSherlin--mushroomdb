@@ -352,11 +352,32 @@ fn apply_one(
         // to a correct scan+filter for reader queries.
         | WalRecord::EnableIndex { .. }
         | WalRecord::DisableIndex { .. }
+        // The opt-in declaration is a writer-side gate; the read path never
+        // decides whether to write a record. A *count* is not a no-op and is
+        // handled below.
+        | WalRecord::SetEdgeCount { count: 0, .. }
         // History markers are no-ops in the read path. Rules re-derive their
         // edges when the ReaderSnapshot queries the live engine; markers only
         // serve edge_history / was_linked WAL scans.
         | WalRecord::DerivedEdgeAdded { .. }
         | WalRecord::DerivedEdgeRetracted { .. } => {}
+
+        // An insert count is an edge property, so the read path carries it the
+        // way it carries any other: absolute, last write wins.
+        WalRecord::SetEdgeCount {
+            etype,
+            src,
+            dst,
+            count,
+        } => {
+            edge_props.set(
+                *etype,
+                *src,
+                *dst,
+                crate::db::EDGE_COUNT_PROP,
+                core_storage::Value::Int(*count as i64),
+            );
+        }
 
         WalRecord::RenameNode { old_key, new_key } => {
             // Recovery-safe: if old_key is already gone (frozen overlay or a

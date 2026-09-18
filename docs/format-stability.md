@@ -105,9 +105,28 @@ the snapshot file, or periodically as a sanity check on storage hardware.
 
 ### WAL (`wal.bin`)
 
-WAL record discriminants 0–22 are append-only: once assigned, a discriminant
+WAL record discriminants 0–23 are append-only: once assigned, a discriminant
 is never reused for a different record shape. New record types receive the next
 available discriminant.
+
+#### Discriminant 23 is opt-in, and taking it is one-way
+
+`SetEdgeCount` (23) carries insert-count multiplicity. It is written **only**
+on a store that has called `enable_multiplicity()`. A store that never calls it
+contains no discriminant-23 record and stays readable by every release from
+v0.6.0 on.
+
+Opting in cannot be undone, and there is no call that undoes it. Unlike an
+unreadable index blob — which degrades, because the reader falls back to a
+correct exhaustive scan — an unreadable WAL record cannot degrade: the reader
+cannot know what the record would have changed.
+
+What an older reader actually does is worse than refusing, and is worth stating
+plainly: `decode_all` treats any frame it cannot deserialise as a corrupt tail
+and returns the valid prefix, so a pre-v0.6.10 binary opening such a store
+**truncates its WAL at the first discriminant-23 frame**, losing every commit
+after it — and persists that truncation when opened for repair. Do not open a
+multiplicity-enabled store with an older binary.
 
 Which `Intern` records a `Batch` frame carries, and where they sit inside it,
 is **not** part of the format contract — only that replaying a frame's records

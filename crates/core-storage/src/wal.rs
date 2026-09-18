@@ -154,6 +154,56 @@ pub enum WalRecord {
         label: String,
         field: String,
     },
+    // ── Multiplicity variant (appended after the index declarations; 23) ─────
+    //
+    // Insert-count multiplicity is **opt-in per store**. This record is written
+    // only after `enable_multiplicity()`; a store that never opts in contains no
+    // discriminant-23 record and stays readable by a decoder that knows only
+    // 0–22.  That gate is the whole design: a reader meeting an unknown
+    // discriminant cannot know what the record would have changed, so it cannot
+    // degrade the way an unreadable index blob does.
+    //
+    // Two shapes share the discriminant, told apart by `count`:
+    //   • `count == 0` — the **declaration** ([`MULTIPLICITY_ENABLED`]): this
+    //     store has opted in.  `etype`/`src`/`dst` are all `u32::MAX`, which no
+    //     real triple can be.  Re-emitted into the baseline WAL by a truncating
+    //     snapshot, exactly as `EnableIndex` is, so the opt-in survives
+    //     truncation.
+    //   • `count >= 2` — `(etype, src, dst)` has been inserted `count` times.
+    //     An absent record means 1.
+    //
+    // The count is **absolute, not a delta**, and that is load-bearing: a
+    // pre-snapshot frame replayed over a base that already folded it in lands on
+    // the same number rather than adding to it.  Counting `InsertEdgeId` records
+    // instead was rejected for exactly the reason the idempotency guard on that
+    // record's apply path documents — it cannot tell "already in the snapshot"
+    // from "a genuine second insert".
+    SetEdgeCount {
+        etype: u32,
+        src: u32,
+        dst: u32,
+        count: u64,
+    },
+}
+
+/// The opt-in declaration: this store records insert-count multiplicity.
+///
+/// A reserved `SetEdgeCount` whose triple is all-`u32::MAX` and whose count is
+/// `0`, neither of which a real pair can be. It carries no count of its own —
+/// it says only that discriminant 23 may now appear in this WAL.
+pub const MULTIPLICITY_ENABLED: WalRecord = WalRecord::SetEdgeCount {
+    etype: u32::MAX,
+    src: u32::MAX,
+    dst: u32::MAX,
+    count: 0,
+};
+
+impl WalRecord {
+    /// Whether this record is the multiplicity opt-in declaration rather than a
+    /// count for a real pair. See [`MULTIPLICITY_ENABLED`].
+    pub fn is_multiplicity_decl(&self) -> bool {
+        matches!(self, WalRecord::SetEdgeCount { count: 0, .. })
+    }
 }
 
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
@@ -826,5 +876,52 @@ mod tests {
             consumed, good_len,
             "stops cleanly before the nested-batch frame"
         );
+    }
+
+    /// Pin discriminant 23 (SetEdgeCount).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn set_edge_count_discriminant_pinned() {
+        let r = WalRecord::SetEdgeCount {
+            etype: 1,
+            src: 2,
+            dst: 3,
+            count: 4,
+        };
+        let payload = bincode::serialize(&r).unwrap();
+        assert_eq!(
+            &payload[0..4],
+            &[23, 0, 0, 0],
+            "SetEdgeCount discriminant changed — a variant was inserted before position 23"
+        );
+        // Roundtrip through encode_record / decode_all.
+        let bytes = encode_record(&r);
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0], r);
+    }
+
+    /// The opt-in declaration and a real count share the discriminant and are
+    /// told apart by `count`, which is `0` only for the declaration.
+    #[test]
+    fn the_multiplicity_declaration_is_not_a_count() {
+        assert!(MULTIPLICITY_ENABLED.is_multiplicity_decl());
+        let bytes = encode_record(&MULTIPLICITY_ENABLED);
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs[0], MULTIPLICITY_ENABLED);
+
+        let real = WalRecord::SetEdgeCount {
+            etype: 0,
+            src: 0,
+            dst: 0,
+            count: 2,
+        };
+        assert!(!real.is_multiplicity_decl());
+        // And a record that is not a count at all is not a declaration either.
+        assert!(!WalRecord::DeleteNode { key: "z".into() }.is_multiplicity_decl());
     }
 }

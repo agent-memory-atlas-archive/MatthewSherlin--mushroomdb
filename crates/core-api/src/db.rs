@@ -34,6 +34,14 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// open-time pass over a store with no `ns` column fills `node_ns` with one
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
+
+/// The reserved edge property holding a pair's insert count (§5.13).
+///
+/// Absent means 1 — the count is written only from the second insert of a
+/// triple onward, and only on a store that called
+/// [`GraphDb::enable_multiplicity`]. The engine owns the name: Cypher `SET` on
+/// it is refused, as the other reserved names are.
+pub const EDGE_COUNT_PROP: &str = "count";
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -354,6 +362,9 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         // state and rules re-derive deterministically on replay.
         | WalRecord::DerivedEdgeAdded { .. }
         | WalRecord::DerivedEdgeRetracted { .. }
+        // A count changes neither the node nor the edge population: the pair it
+        // counts was already there, which is why it is written at all.
+        | WalRecord::SetEdgeCount { .. }
         // RenameNode carries no node/edge count change; no special event.
         | WalRecord::RenameNode { .. } => None,
     }
@@ -1523,6 +1534,14 @@ pub struct GraphDb<F: Fs> {
     /// Rebuild-on-open: declarations replay from the WAL, postings rebuild at
     /// open end (mirrors `fulltext`).
     prop_index: PropertyIndex,
+    /// Whether this store records insert-count multiplicity (§5.13).
+    ///
+    /// Declared like `prop_index`'s enabled pairs — a WAL record replayed at
+    /// open, re-emitted into the baseline by a truncating snapshot — but it
+    /// gates a *format* step rather than an index: `WalRecord::SetEdgeCount`
+    /// (discriminant 23) is written only when this is `true`, so a store that
+    /// never opts in stays readable by a binary that predates the record.
+    multiplicity: bool,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
     /// WAL fsync cadence. Default [`FsyncPolicy::Strict`].
     fsync: FsyncPolicy,
@@ -2233,6 +2252,7 @@ impl<F: Fs> GraphDb<F> {
             view_store: ViewStore::new(),
             fulltext: FulltextIndex::new(),
             prop_index: PropertyIndex::new(),
+            multiplicity: false,
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
@@ -2297,6 +2317,9 @@ impl<F: Fs> GraphDb<F> {
         self.view_store = ViewStore::new();
         self.fulltext = FulltextIndex::new();
         self.prop_index = PropertyIndex::new();
+        // Cleared like every other declaration: a reload replays the store's own
+        // WAL, and the opt-in comes back from it or not at all.
+        self.multiplicity = false;
         self.commit_seq = 0;
         self.roles = Some(vec![]);
         // A fresh cache, not a cleared one: any reader snapshot still holding
@@ -4367,6 +4390,32 @@ impl<F: Fs> GraphDb<F> {
             WalRecord::DisableIndex { label, field } => {
                 self.prop_index.disable(label, field);
             }
+            // ── insert-count multiplicity (§5.13) ────────────────────────────
+            //
+            // Two shapes, told apart by `count`: the opt-in declaration, and an
+            // absolute count for one triple. Absolute is what makes this
+            // idempotent over a snapshot base — a pre-snapshot frame replayed
+            // over a base that already folded it in lands on the same number
+            // rather than adding to it, which is the failure a delta (or a count
+            // derived from `InsertEdgeId` records) would have.
+            WalRecord::SetEdgeCount {
+                etype,
+                src,
+                dst,
+                count,
+            } => {
+                if rec.is_multiplicity_decl() {
+                    self.multiplicity = true;
+                } else {
+                    self.edge_props.set(
+                        *etype,
+                        *src,
+                        *dst,
+                        EDGE_COUNT_PROP,
+                        Value::Int(*count as i64),
+                    );
+                }
+            }
             // History markers carry no replay state — rules re-derive edges
             // deterministically on open/replay. Skip unconditionally.
             WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => {}
@@ -5395,6 +5444,9 @@ impl<F: Fs> GraphDb<F> {
             // fired the EdgeFired/EdgeRetracted subscription events.
             | WalRecord::DerivedEdgeAdded { .. }
             | WalRecord::DerivedEdgeRetracted { .. }
+            // A count is not an edge event: the pair it counts already fired one
+            // when it was first inserted.
+            | WalRecord::SetEdgeCount { .. }
             | WalRecord::RenameNode { .. } => vec![],
         }
     }
@@ -5769,6 +5821,11 @@ impl<F: Fs> GraphDb<F> {
             // out what it removes. Resolved on the first `Replace` in the frame
             // and reused, so N replaces read the field list once, not N times.
             let mut store_fields: Option<Vec<String>> = None;
+            // Insert counts raised earlier in *this* frame. `edge_count_record`
+            // reads committed state, which cannot see a count this frame has
+            // already queued, so three duplicates in one batch would otherwise
+            // all compute the same number and the last would win.
+            let mut pending_counts: HashMap<(u32, u32, u32), u64> = HashMap::new();
             for op in ops {
                 match op {
                     BatchOp::InsertNode { label, key, props } => {
@@ -5852,6 +5909,18 @@ impl<F: Fs> GraphDb<F> {
                                 src_key,
                                 dst_key,
                             });
+                        } else if let Some(rec) = preview.db.edge_count_record_pending(
+                            &edge_type,
+                            &src_key,
+                            &dst_key,
+                            &mut pending_counts,
+                        ) {
+                            // A duplicate inside a batch counts the way a
+                            // duplicate through `insert_edge` does: `ingest` and
+                            // Cypher `CREATE` reach this choke-point and not
+                            // that one, and a count only one entry point keeps
+                            // would be worse than no count at all.
+                            recs.push(rec);
                         }
                     }
                     BatchOp::SetProp { key, field, value } => {
@@ -5936,6 +6005,18 @@ impl<F: Fs> GraphDb<F> {
                                 src_key,
                                 dst_key,
                             });
+                        } else if let Some(rec) = preview.db.edge_count_record_pending(
+                            &edge_type,
+                            &src_key,
+                            &dst_key,
+                            &mut pending_counts,
+                        ) {
+                            // A duplicate inside a batch counts the way a
+                            // duplicate through `insert_edge` does: `ingest` and
+                            // Cypher `CREATE` reach this choke-point and not
+                            // that one, and a count only one entry point keeps
+                            // would be worse than no count at all.
+                            recs.push(rec);
                         }
                     }
                 }
@@ -6086,11 +6167,27 @@ impl<F: Fs> GraphDb<F> {
         }])
     }
 
+    /// Insert a user edge. `Ok(true)` when the pair was new, `Ok(false)` when it
+    /// was already there — the question is "was this pair new", and a duplicate
+    /// does not make it so.
+    ///
+    /// On a store that called [`enable_multiplicity`](Self::enable_multiplicity)
+    /// a duplicate is no longer a total no-op: it raises the pair's insert count
+    /// (§5.13). Adjacency is still a set, so [`degree`](Self::degree) is
+    /// unchanged and the return value is still `Ok(false)`; the count is visible
+    /// only through [`degree_multiplicity`](Self::degree_multiplicity) and the
+    /// reserved [`EDGE_COUNT_PROP`]. On every other store a duplicate writes
+    /// nothing at all, as it always has.
     pub fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
         if !MutPreview::new(self).prepare_insert_edge(edge_type, src_key, dst_key)? {
+            // The pair exists. The only thing left to record is that it was
+            // asked for again, and only where the store asked to be told.
+            if let Some(rec) = self.edge_count_record(edge_type, src_key, dst_key) {
+                self.log_then_apply(rec)?;
+            }
             return Ok(false);
         }
         self.log_dense(vec![WalRecord::InsertEdge {
@@ -6733,6 +6830,127 @@ impl<F: Fs> GraphDb<F> {
     /// Whether `(label, field)` currently has an equality index.
     pub fn is_index_enabled(&self, label: &str, field: &str) -> bool {
         self.prop_index.is_enabled(label, field)
+    }
+
+    /// Start recording insert-count multiplicity on this store (§5.13).
+    ///
+    /// Adjacency stays a set and nothing about an existing read changes: a
+    /// duplicate [`insert_edge`](Self::insert_edge) still returns `Ok(false)`
+    /// and still leaves [`degree`](Self::degree) alone. What it gains is that
+    /// the duplicate is *counted*, as the reserved edge property
+    /// [`EDGE_COUNT_PROP`], readable through
+    /// [`degree_multiplicity`](Self::degree_multiplicity).
+    ///
+    /// # This is a one-way step, and that is why it is a call
+    ///
+    /// The count is durable, so it is written to the WAL — as discriminant 23,
+    /// which no release before v0.6.10 knows. A reader meeting an unknown WAL
+    /// discriminant cannot know what the record would have changed, so it
+    /// cannot degrade the way an unreadable index blob can; it stops at that
+    /// frame. **After this call the store can no longer be read whole by an
+    /// older binary, and there is no call that undoes it.** Gating the record
+    /// behind this method is what keeps that step a decision an operator makes
+    /// when they want the feature, rather than one everybody takes by
+    /// upgrading.
+    ///
+    /// Calling it on a store that has already opted in writes nothing and
+    /// returns `Ok(())`: an operator should not have to ask first.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    pub fn enable_multiplicity(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.multiplicity {
+            return Ok(());
+        }
+        self.log_then_apply(core_storage::wal::MULTIPLICITY_ENABLED)
+    }
+
+    /// Whether this store records insert-count multiplicity.
+    ///
+    /// `false` on every store that has not called
+    /// [`enable_multiplicity`](Self::enable_multiplicity) — which is every
+    /// store that did not ask for it, including one upgraded from an earlier
+    /// release.
+    pub fn is_multiplicity_enabled(&self) -> bool {
+        self.multiplicity
+    }
+
+    /// How many times `(etype, src, dst)` has been inserted: the reserved
+    /// `count` edge property, or 1 when it is absent.
+    ///
+    /// Answers 1 for a pair on a store that never opted in, which is the truth
+    /// available there — the pair was inserted at least once, and the store
+    /// kept no record of any second insert.
+    fn edge_insert_count(&self, etype: u32, src: u32, dst: u32) -> u64 {
+        match self.edge_props_view().get(etype, src, dst, EDGE_COUNT_PROP) {
+            Some(Value::Int(n)) if n > 0 => n as u64,
+            _ => 1,
+        }
+    }
+
+    /// The `SetEdgeCount` record a duplicate insert of `(edge_type, src_key,
+    /// dst_key)` should log, or `None` when nothing should be written.
+    ///
+    /// `None` covers three cases, and the first is the one that matters: the
+    /// store has not opted in, so **no discriminant-23 record is written at
+    /// all**. The other two are a pair whose etype or endpoints are not yet
+    /// interned — which, for a duplicate of an existing pair, means the pair
+    /// was created earlier in this same batch and has no dense id to name yet.
+    fn edge_count_record(
+        &self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+    ) -> Option<WalRecord> {
+        if !self.multiplicity {
+            return None;
+        }
+        let etype = self.syms.get(edge_type)?;
+        let src = self.ids.get(src_key)?;
+        let dst = self.ids.get(dst_key)?;
+        Some(WalRecord::SetEdgeCount {
+            etype,
+            src,
+            dst,
+            count: self.edge_insert_count(etype, src, dst).saturating_add(1),
+        })
+    }
+
+    /// [`edge_count_record`](Self::edge_count_record) for a batch, where the
+    /// counts this frame has already queued are not yet in committed state.
+    ///
+    /// `pending` carries them forward, so N duplicates of one pair in one frame
+    /// end on `committed + N` rather than all computing `committed + 1`.
+    fn edge_count_record_pending(
+        &self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+        pending: &mut HashMap<(u32, u32, u32), u64>,
+    ) -> Option<WalRecord> {
+        let WalRecord::SetEdgeCount {
+            etype,
+            src,
+            dst,
+            count,
+        } = self.edge_count_record(edge_type, src_key, dst_key)?
+        else {
+            return None;
+        };
+        let next = match pending.get(&(etype, src, dst)) {
+            Some(queued) => queued.saturating_add(1),
+            None => count,
+        };
+        pending.insert((etype, src, dst), next);
+        Some(WalRecord::SetEdgeCount {
+            etype,
+            src,
+            dst,
+            count: next,
+        })
     }
 
     /// Search a full-text-indexed field.
@@ -9911,6 +10129,25 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         let rel_vars = pattern_rel_vars(&stmt.matches);
+        // `count` is the engine's, on an edge: it is the insert-count §5.13
+        // maintains, and a `SET` that overwrote it would make the number mean
+        // whatever the last writer said rather than how many times the pair was
+        // inserted. Refused by name here, before the match runs, so the caller
+        // is told what is actually wrong instead of meeting the executor's
+        // generic "did not resolve to a node key" — and so the answer does not
+        // depend on whether the pattern happened to match a row. The same name
+        // on a *node* is an ordinary property and is untouched.
+        for s in &stmt.sets {
+            if s.field == EDGE_COUNT_PROP && rel_vars.iter().any(|r| r == &s.var) {
+                return Err(GraphError::QueryError {
+                    detail: format!(
+                        "cannot SET {}.{EDGE_COUNT_PROP}: `{EDGE_COUNT_PROP}` is a reserved edge \
+                         property holding the pair's insert count",
+                        s.var
+                    ),
+                });
+            }
+        }
         let mut lookup_vars = set_vars.clone();
         for v in pattern_node_vars(&stmt.matches) {
             add_var(&mut lookup_vars, &v);
@@ -10758,6 +10995,56 @@ impl<F: Fs> GraphDb<F> {
         ))
     }
 
+    /// [`degree`](Self::degree) summing each pair's **insert count** instead of
+    /// counting each pair once (§5.13).
+    ///
+    /// The unique degree asks how many neighbours there are; this asks how many
+    /// times they were inserted. A pair with no recorded count contributes 1,
+    /// so on a store that never called
+    /// [`enable_multiplicity`](Self::enable_multiplicity) this returns exactly
+    /// what [`degree`](Self::degree) returns rather than erroring — the
+    /// distinction is a readout preference, not a demand the store cannot meet.
+    ///
+    /// `AlgoDir::Both` still sums out + in, so a pair visible on both sides
+    /// still contributes twice: multiplicity changes what a pair is worth, never
+    /// how a direction is counted.
+    pub fn degree_multiplicity(
+        &self,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+    ) -> Result<u64> {
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        Ok(self.multiplicity_directed_degree(id, edge_type, direction, None))
+    }
+
+    /// [`degree_multiplicity`](Self::degree_multiplicity) under a scope.
+    ///
+    /// The sum covers **visible pairs only**. A hidden neighbour's inserts stay
+    /// out of it for the reason
+    /// [`degree_scoped`](Self::degree_scoped) documents, and more sharply: an
+    /// unscoped multiplicity count discloses not only that a hidden neighbour
+    /// exists but how often it was written.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
+    pub fn degree_scoped_multiplicity(
+        &self,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<u64> {
+        let id = self
+            .ids
+            .get(key)
+            .filter(|&id| mask.contains_id(id))
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        Ok(self.multiplicity_directed_degree(id, edge_type, direction, Some(mask)))
+    }
+
     /// [`degree`](Self::degree) counting **only neighbours the mask admits**.
     ///
     /// The filter is a correctness requirement, not an optimisation: an
@@ -10801,7 +11088,55 @@ impl<F: Fs> GraphDb<F> {
         direction: crate::algo::AlgoDir,
         limit: Option<usize>,
     ) -> Result<Vec<(String, u64)>> {
-        self.degrees_inner(keys, label, where_, edge_type, direction, limit, None)
+        self.degrees_inner(
+            keys, label, where_, edge_type, direction, limit, None, false,
+        )
+    }
+
+    /// [`degrees`](Self::degrees) reporting each row's **insert-count** sum
+    /// instead of its unique neighbour count, as
+    /// [`degree_multiplicity`](Self::degree_multiplicity) does for one key.
+    ///
+    /// The sort is still degree descending, key ascending — over the counts this
+    /// reading produces — and `limit` still applies after it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn degrees_multiplicity(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, u64)>> {
+        self.degrees_inner(keys, label, where_, edge_type, direction, limit, None, true)
+    }
+
+    /// [`degrees_scoped`](Self::degrees_scoped) reporting insert counts.
+    ///
+    /// Both filters apply: a hidden key stays out of the result, and every
+    /// row's sum covers its **visible** pairs only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn degrees_scoped_multiplicity(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<(String, u64)>> {
+        self.degrees_inner(
+            keys,
+            label,
+            where_,
+            edge_type,
+            direction,
+            limit,
+            Some(mask),
+            true,
+        )
     }
 
     /// [`degrees`](Self::degrees) with the scope applied on both sides: a hidden
@@ -10825,7 +11160,16 @@ impl<F: Fs> GraphDb<F> {
         limit: Option<usize>,
         mask: &crate::mask::NodeMask,
     ) -> Result<Vec<(String, u64)>> {
-        self.degrees_inner(keys, label, where_, edge_type, direction, limit, Some(mask))
+        self.degrees_inner(
+            keys,
+            label,
+            where_,
+            edge_type,
+            direction,
+            limit,
+            Some(mask),
+            false,
+        )
     }
 
     /// The body shared by [`degrees`](Self::degrees) and
@@ -10841,6 +11185,7 @@ impl<F: Fs> GraphDb<F> {
         direction: crate::algo::AlgoDir,
         limit: Option<usize>,
         mask: Option<&crate::mask::NodeMask>,
+        multiplicity: bool,
     ) -> Result<Vec<(String, u64)>> {
         if let Some(pred) = where_ {
             pred.validate_named("where")
@@ -10882,11 +11227,12 @@ impl<F: Fs> GraphDb<F> {
             .filter(|&id| mask.is_none_or(|m| m.contains_id(id)))
             .filter_map(|id| {
                 let key = self.ids.key_of(id)?.to_string();
-                let deg = match mask {
-                    Some(m) => Self::visible_directed_degree(
+                let deg = match (multiplicity, mask) {
+                    (true, m) => self.multiplicity_directed_degree(id, edge_type, direction, m),
+                    (false, Some(m)) => Self::visible_directed_degree(
                         &view.topo, view.syms, id, edge_type, direction, m,
                     ),
-                    None => Self::unique_directed_degree(
+                    (false, None) => Self::unique_directed_degree(
                         &view.topo, view.syms, id, edge_type, direction,
                     ),
                 };
@@ -10965,6 +11311,59 @@ impl<F: Fs> GraphDb<F> {
         match edge_type {
             Some(name) => syms.get(name).map_or(0, visible),
             None => topo.etypes().map(visible).sum(),
+        }
+    }
+
+    /// Sum of the insert counts of `id`'s pairs (§5.13), over `edge_type` (or
+    /// all types) and `direction`, restricted to what `mask` admits when one is
+    /// given.
+    ///
+    /// The same neighbour lists the unique reading measures, with each entry
+    /// worth its pair's count rather than worth 1 — so the filter decides which
+    /// pairs are in the sum and the count decides what each contributes. A
+    /// direction decides which way round the pair is addressed: an `In`
+    /// neighbour `n` of `id` is the pair `(et, n, id)`.
+    ///
+    /// Takes `&self` rather than the view parameters the unique helpers take
+    /// because the counts live in the edge-property view, which is built from
+    /// the overlay and the mmap'd base together.
+    fn multiplicity_directed_degree(
+        &self,
+        id: u32,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        mask: Option<&crate::mask::NodeMask>,
+    ) -> u64 {
+        let dirs: &[Direction] = match direction {
+            crate::algo::AlgoDir::Out => &[Direction::Out],
+            crate::algo::AlgoDir::In => &[Direction::In],
+            crate::algo::AlgoDir::Both => &[Direction::Out, Direction::In],
+        };
+        let topo = self.topo_view();
+        let edge_props = self.edge_props_view();
+        let count_of = |et: u32, src: u32, dst: u32| -> u64 {
+            match edge_props.get(et, src, dst, EDGE_COUNT_PROP) {
+                Some(Value::Int(n)) if n > 0 => n as u64,
+                _ => 1,
+            }
+        };
+        let per_etype = |et: u32| -> u64 {
+            dirs.iter()
+                .map(|&d| {
+                    topo.neighbors(et, d, id)
+                        .iter()
+                        .filter(|&&n| mask.is_none_or(|m| m.contains_id(n)))
+                        .map(|&n| match d {
+                            Direction::Out => count_of(et, id, n),
+                            Direction::In => count_of(et, n, id),
+                        })
+                        .sum::<u64>()
+                })
+                .sum()
+        };
+        match edge_type {
+            Some(name) => self.syms.get(name).map_or(0, per_etype),
+            None => topo.etypes().map(per_etype).sum(),
         }
     }
 
@@ -11103,6 +11502,15 @@ impl<F: Fs> GraphDb<F> {
                 self.last_change.insert(*src, seq);
                 self.last_change.insert(*dst, seq);
             }
+            // A count record touches the pair, so it touches both endpoints —
+            // the same reading `InsertEdgeId` gets, because a duplicate insert
+            // that raises the count *is* a mutation of that pair. The opt-in
+            // declaration touches nothing.
+            WalRecord::SetEdgeCount { src, dst, .. } if !rec.is_multiplicity_decl() => {
+                self.last_change.insert(*src, seq);
+                self.last_change.insert(*dst, seq);
+            }
+            WalRecord::SetEdgeCount { .. } => {}
             // DeleteNode: node is tombstoned; last_changed(key) returns None for
             // deleted keys (ids.get() returns None post-tombstone), so no update needed.
             // History markers: state no-ops; the underlying mutation already
@@ -12739,6 +13147,13 @@ impl<F: Fs> GraphDb<F> {
 
             // Write new minimal baseline WAL (mirrors the keep_wal=false path).
             let mut baseline_wal: Vec<u8> = Vec::new();
+            // The multiplicity opt-in is a declaration like the two below it,
+            // and it is re-emitted for the same reason: truncation must not
+            // silently opt the store back out and stop counting.
+            if self.multiplicity {
+                baseline_wal
+                    .extend_from_slice(&encode_record(&core_storage::wal::MULTIPLICITY_ENABLED));
+            }
             for (label, field) in self.fulltext.enabled_pairs() {
                 let rec = WalRecord::EnableFulltext {
                     label: label.clone(),
@@ -12782,6 +13197,13 @@ impl<F: Fs> GraphDb<F> {
                 self.archive_genesis_chain = false;
             }
             let mut baseline_wal: Vec<u8> = Vec::new();
+            // The multiplicity opt-in is a declaration like the two below it,
+            // and it is re-emitted for the same reason: truncation must not
+            // silently opt the store back out and stop counting.
+            if self.multiplicity {
+                baseline_wal
+                    .extend_from_slice(&encode_record(&core_storage::wal::MULTIPLICITY_ENABLED));
+            }
             for (label, field) in self.fulltext.enabled_pairs() {
                 let rec = WalRecord::EnableFulltext {
                     label: label.clone(),

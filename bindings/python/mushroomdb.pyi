@@ -476,13 +476,20 @@ class GraphDb:
         """Start recording a per-pair insert count on this store.
 
         Opt-in, and **one way**: it writes a declaration record the previous
-        release's decoder cannot read. A 0.6.9 binary opening a store that has
-        enabled multiplicity does not refuse it — it treats the first such
-        record as a corrupt WAL tail, replays only the commits before it, and
-        persists that truncation. Every commit after the declaration is lost.
+        release's decoder cannot read. Left alone, a 0.6.9 binary would not
+        refuse such a store — it would treat the first such record as a corrupt
+        WAL tail, replay only the commits before it, and persist that
+        truncation.
 
-        A store that never calls this contains no such record and stays
-        readable by 0.6.9 indefinitely. Refused on a scoped handle.
+        So the call also takes a snapshot, at a format version 0.6.9 does not
+        know, and it takes it **before** writing the record. A 0.6.9 binary
+        stops at `snapshot: unsupported version 10` and leaves the WAL exactly
+        as it found it. The cost is one full snapshot write; the snapshot keeps
+        the WAL, so history stays reachable.
+
+        A store that never calls this contains no such record, keeps writing
+        the old snapshot version, and stays readable by 0.6.9 indefinitely.
+        Refused on a scoped handle.
         """
 
     def is_multiplicity_enabled(self) -> bool:

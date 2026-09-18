@@ -1447,8 +1447,13 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
     let current = core_api::SNAPSHOT_VERSION;
     let from_ver = core_api::snapshot_version_at(db_dir)?;
 
-    if from_ver == Some(current) {
-        return Ok(format!("already current (V{current})\n"));
+    // `>=`, not `==`: a store that has opted in to multiplicity writes V10, a
+    // version above the default this binary writes. It is already current —
+    // rewriting it would produce another V10 snapshot and report "V10 -> V9".
+    if let Some(ver) = from_ver {
+        if ver >= current {
+            return Ok(format!("already current (V{ver})\n"));
+        }
     }
 
     // Copy the original snapshot to .bak at OS level — no in-memory buffer

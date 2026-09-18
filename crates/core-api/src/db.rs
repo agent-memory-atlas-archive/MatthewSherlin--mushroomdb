@@ -2382,13 +2382,17 @@ impl<F: Fs> GraphDb<F> {
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
         // default impl reads all bytes and truncates (still correct).
         let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
-        // V8 and V9 share the mmap-able container; V9 only adds section 12.
+        // V8, V9 and V10 share the mmap-able container; V9 only adds section 12
+        // and V10 adds nothing but its version stamp. A version outside that set
+        // falls through to the full-read path below, where `snapshot::decode`
+        // either handles it (V5–V7) or refuses it by name — which is what stops
+        // an older binary before it reaches the WAL.
         let is_v8 = snap_header.len() >= 6
             && &snap_header[0..4] == b"GDB1"
-            && matches!(
-                u16::from_le_bytes([snap_header[4], snap_header[5]]),
-                core_storage::snapshot::VERSION_8 | core_storage::snapshot::VERSION_9
-            );
+            && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
+                snap_header[4],
+                snap_header[5],
+            ]));
         if is_v8 {
             // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
             // No 2.4GB heap Vec is allocated on RealFs.
@@ -3197,10 +3201,10 @@ impl<F: Fs> GraphDb<F> {
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
             let is_v8 = snap_header.len() >= 6
                 && &snap_header[0..4] == b"GDB1"
-                && matches!(
-                    u16::from_le_bytes([snap_header[4], snap_header[5]]),
-                    core_storage::snapshot::VERSION_8 | core_storage::snapshot::VERSION_9
-                );
+                && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
+                    snap_header[4],
+                    snap_header[5],
+                ]));
             if is_v8 {
                 let state = if let Some(snap_path) = db.fs.snapshot_path() {
                     let mapped = core_storage::v8::MappedBase::map(&snap_path).map_err(|e| {
@@ -6846,18 +6850,36 @@ impl<F: Fs> GraphDb<F> {
     /// The count is durable, so it is written to the WAL — as discriminant 23,
     /// which no release before v0.6.10 knows. A reader meeting an unknown WAL
     /// discriminant cannot know what the record would have changed, so it
-    /// cannot degrade the way an unreadable index blob can; it stops at that
-    /// frame. **After this call the store can no longer be read whole by an
-    /// older binary, and there is no call that undoes it.** Gating the record
-    /// behind this method is what keeps that step a decision an operator makes
-    /// when they want the feature, rather than one everybody takes by
-    /// upgrading.
+    /// cannot degrade the way an unreadable index blob can. **After this call
+    /// the store can no longer be read by an older binary, and there is no call
+    /// that undoes it.** Gating the record behind this method is what keeps
+    /// that step a decision an operator makes when they want the feature,
+    /// rather than one everybody takes by upgrading.
+    ///
+    /// # It fails loudly, and that costs a snapshot
+    ///
+    /// An older binary does not refuse discriminant 23 — it truncates the WAL
+    /// at it and, with `repair_wal`, persists the truncation. So this call also
+    /// writes a **V10 snapshot**, a version no earlier release knows, and it
+    /// writes it *first*: the snapshot is read before the WAL, so an older
+    /// binary stops at `snapshot: unsupported version 10` with the WAL
+    /// untouched. Taking the snapshot before appending the record is what makes
+    /// the guard unconditional — the store is never, at any interruption point,
+    /// carrying the record without the stamp that announces it.
+    ///
+    /// The snapshot keeps the WAL (`keep_wal: true`): opting in is not a
+    /// compaction, and history reachable by [`open_at`](Self::open_at) stays
+    /// reachable. On a large store the call therefore costs one full snapshot
+    /// write.
     ///
     /// Calling it on a store that has already opted in writes nothing and
     /// returns `Ok(())`: an operator should not have to ask first.
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - Anything [`snapshot_with`](Self::snapshot_with) can return: the store
+    ///   is left opted *out* (a V10 snapshot may remain on disk, which only
+    ///   costs an older reader a refusal it did not strictly need).
     pub fn enable_multiplicity(&mut self) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -6865,7 +6887,33 @@ impl<F: Fs> GraphDb<F> {
         if self.multiplicity {
             return Ok(());
         }
-        self.log_then_apply(core_storage::wal::MULTIPLICITY_ENABLED)
+        // The snapshot goes first, and the order is the guard.
+        //
+        // An older reader refuses a V10 snapshot by name and stops; it does not
+        // refuse discriminant 23, it truncates the WAL at it. So the store must
+        // never hold the record without the snapshot that announces it — not
+        // even for the width of one fsync. Writing the snapshot before the
+        // record makes the only reachable intermediate state "V10 snapshot, no
+        // record", which is merely conservative: this binary reads it as a
+        // store that has not opted in, and an older one refuses it.
+        //
+        // `keep_wal: true` because opting in is not a compaction: an operator
+        // asking for multiplicity has not asked to lose the history `open_at`
+        // can reach.
+        self.multiplicity = true;
+        let forced = self
+            .snapshot_with(SnapshotOptions {
+                keep_wal: true,
+                ..SnapshotOptions::default()
+            })
+            .and_then(|()| self.log_then_apply(core_storage::wal::MULTIPLICITY_ENABLED));
+        if forced.is_err() {
+            // Nothing was declared, so nothing is enabled. A V10 snapshot may
+            // still be on disk; it costs an older reader a refusal it did not
+            // strictly need, which is the safe direction to fail in.
+            self.multiplicity = false;
+        }
+        forced
     }
 
     /// Whether this store records insert-count multiplicity.
@@ -12828,6 +12876,12 @@ impl<F: Fs> GraphDb<F> {
         // new store that only used keep_wal=true.  Conservative: refuse genesis in
         // both cases.  Must be sampled here, before the snapshot write below.
         let had_prior_snapshot = self.fs.snapshot_path().map(|p| p.exists()).unwrap_or(false);
+        // Which version this store writes. V9 unless it has opted in to
+        // multiplicity, in which case V10 — the stamp that makes a reader which
+        // does not know WAL discriminant 23 refuse the open instead of
+        // truncating the WAL at the first such frame. The container is
+        // identical either way; only these two header bytes move.
+        let snapshot_version = core_storage::snapshot::version_for(self.multiplicity);
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
         self.engine.ensure_provenance_loaded_mut();
@@ -12948,6 +13002,7 @@ impl<F: Fs> GraphDb<F> {
                     &mut buf,
                 )?;
             }
+            core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written snapshot as the new base.
             // C2: use file mmap on RealFs; fall back to from_bytes on SimFs.
@@ -13009,6 +13064,7 @@ impl<F: Fs> GraphDb<F> {
             // meta (and the moved edge_props inside it) is no longer needed;
             // drop it before the write to keep the peak window narrow.
             drop(meta);
+            core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written V8 snapshot as self.base.
             // On RealFs: drop the encode buffer before mmap to recover ~1.9 GiB.

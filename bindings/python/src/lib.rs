@@ -979,9 +979,15 @@ impl GraphDb {
     /// **This is a one-way step and there is no call that undoes it.** The count
     /// is durable, so it is written to the write-ahead log as a record no
     /// release before this one knows how to read; a store that has recorded one
-    /// can no longer be read whole by an older binary. A store that never calls
-    /// this writes no such record and stays readable. Calling it twice writes
+    /// can no longer be read by an older binary. A store that never calls this
+    /// writes no such record and stays readable. Calling it twice writes
     /// nothing the second time.
+    ///
+    /// The call also takes a snapshot, at a format version older releases do
+    /// not know, before it writes that record — so an older binary refuses the
+    /// store by name instead of silently truncating its write-ahead log. On a
+    /// large store this costs one full snapshot write. History stays reachable:
+    /// the snapshot keeps the log rather than truncating it.
     #[pyo3(text_signature = "($self)")]
     fn enable_multiplicity(&self) -> PyResult<()> {
         self.with_mut(|db| db.enable_multiplicity())

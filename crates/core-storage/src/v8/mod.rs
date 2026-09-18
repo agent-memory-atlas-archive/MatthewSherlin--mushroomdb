@@ -713,14 +713,20 @@ fn parse_header(mmap: &[u8]) -> Result<Vec<SectionEntry>> {
         });
     }
     // Infallible: `mmap.len() >= HEADER_SIZE` checked above; slices are exactly 2 bytes each.
-    // V8 and V9 share this container byte-for-byte: same magic, same 4 KB
+    // V8, V9 and V10 share this container byte-for-byte: same magic, same 4 KB
     // header page, same 16-byte directory entries, same per-section CRC.  V9
     // only adds section 12 and empties the per-column string tables, so one
-    // parser serves both and `string_table()` is what tells them apart.
+    // parser serves both and `string_table()` is what tells them apart.  V10
+    // adds nothing at all to the container — it declares that the store's WAL
+    // may carry discriminant 23, so that a reader which does not know that
+    // record refuses the open here rather than truncating the WAL later.
     let version = u16::from_le_bytes(mmap[4..6].try_into().unwrap());
-    if version != crate::snapshot::VERSION_8 && version != crate::snapshot::VERSION_9 {
+    if !crate::snapshot::is_mmap_container(version) {
         return Err(GraphError::Corrupt {
-            detail: format!("v8: expected version 8 or 9, got {version}"),
+            detail: format!(
+                "v8: expected one of versions {:?}, got {version}",
+                crate::snapshot::MMAP_CONTAINER_VERSIONS
+            ),
         });
     }
     let section_count = u16::from_le_bytes(mmap[6..8].try_into().unwrap()) as usize;

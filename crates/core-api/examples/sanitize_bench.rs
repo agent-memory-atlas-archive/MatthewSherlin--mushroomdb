@@ -65,8 +65,7 @@ fn main() {
     // the Unicode arms on every byte that can never match them.
     let line = "crates/core-api/src/db.rs · fn find_similar_vector_filtered · \
                 1,204 commits · alice@example.com";
-    let corpus: String = std::iter::repeat(line)
-        .take(4_000)
+    let corpus: String = std::iter::repeat_n(line, 4_000)
         .collect::<Vec<_>>()
         .join("\n");
     let reps = 50;

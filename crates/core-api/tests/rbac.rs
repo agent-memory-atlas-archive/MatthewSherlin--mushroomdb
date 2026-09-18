@@ -369,6 +369,53 @@ fn corrupt_roles_json_open_succeeds_mask_for_role_errs() {
 }
 
 // ---------------------------------------------------------------------------
+// v0.6.10 §5.8: `roles_checked` is the readout that can say it does not know
+// ---------------------------------------------------------------------------
+#[test]
+fn roles_checked_fails_loud_where_roles_answers_empty() {
+    let dir = tmp("roles-checked-corrupt");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A store with no sidecar at all: the empty list is the honest answer.
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(db
+        .roles_checked()
+        .expect("no roles is not an error")
+        .is_empty());
+
+    let schema = Schema {
+        fulltext: vec![],
+        indexes: vec![],
+        rules: vec![],
+        views: vec![],
+        roles: vec![analyst_role()],
+    };
+    db.apply_schema(&schema).unwrap();
+    assert_eq!(db.roles_checked().unwrap().len(), 1);
+    drop(db);
+
+    std::fs::write(dir.join("roles.json"), b"this is not valid json").unwrap();
+    let db = GraphDb::open(&dir).unwrap();
+
+    // The two states a caller has to tell apart, and the readout that cannot:
+    // an unrestricted store answers `[]` here too, so a boot-time check against
+    // `roles()` alone passes on a store no role can read.
+    assert!(db.roles().is_empty());
+    let err = db
+        .roles_checked()
+        .expect_err("a poisoned sidecar must not read as 'no roles are defined'");
+    assert!(
+        matches!(err, core_api::GraphError::Corrupt { .. }),
+        "expected the poison error, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        db.mask_for_role("analyst").unwrap_err().to_string(),
+        "one cause, one answer: the readout and the resolver must not drift"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Bonus: validation — empty role name and duplicate role name are rejected
 // ---------------------------------------------------------------------------
 #[test]

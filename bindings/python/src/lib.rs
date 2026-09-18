@@ -4,6 +4,7 @@ use core_api::{
     NodeInfo, NodeMask, OnConflict, PredicateSummary, PropPredicate, ResultSet, RuleDef, Scope,
     Value, NS_MAX_LEN, NS_PROP,
 };
+use core_api::restore::{restore_if_empty, RestoreOutcome};
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -1434,6 +1435,63 @@ impl GraphDb {
         Ok(d.unbind())
     }
 
+    /// The roles `roles.json` defines, as a list of dicts.
+    ///
+    /// Each dict carries `name`, `labels`, `keys`, `namespaces` and
+    /// `visible_where`. `namespaces` is `None` for a role bound to no
+    /// namespace — which means every one, not none — and `visible_where` is
+    /// `None` or `{"field": …, "eq": …, "in": […]}`, the shape `where=` takes.
+    ///
+    /// `[]` when the store defines no roles. **Raises `Corrupt` when
+    /// `roles.json` was corrupt at open**, which is what `scoped(role=…)` and
+    /// every role-scoped read already do for the same cause. Answering `[]`
+    /// there would be the dangerous answer: an unrestricted store answers `[]`
+    /// too, so a poisoned sidecar would read as "nothing is restricted here".
+    ///
+    /// This is the call that lets a sidecar check a role name at boot instead
+    /// of discovering the typo on its first request:
+    ///
+    /// ```python
+    /// known = {r["name"] for r in db.roles()}
+    /// missing = configured_roles - known        # fail the boot, not the request
+    /// ```
+    ///
+    /// Refused on a scoped handle — see the note on `scoped()`.
+    #[pyo3(text_signature = "($self)")]
+    fn roles(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        // The one schema surface made of node data. A role definition names the
+        // node keys it grants outright, the namespaces `stats()` is at pains to
+        // narrow, and the name of every other role in the store. Narrowing it is
+        // no better than leaking it: a definition with its hidden keys filtered
+        // out is not the definition, and a caller checking a role against a
+        // doctored copy is worse off than one that was refused.
+        if self.scope.is_some() {
+            return Err(PyValueError::new_err(
+                "roles() is refused on a scoped handle: a role definition names node keys, \
+                 namespaces and the other roles in the store, and a narrowed copy would not be \
+                 the definition; call it on the handle scoped() was called on",
+            ));
+        }
+        let roles = self.with_ref(|db| db.roles_checked())?;
+        let out = PyList::empty(py);
+        for r in &roles {
+            let d = PyDict::new(py);
+            d.set_item("name", &r.name)?;
+            d.set_item("labels", r.labels.clone())?;
+            d.set_item("keys", r.keys.clone())?;
+            match &r.namespaces {
+                Some(ns) => d.set_item("namespaces", ns.clone())?,
+                None => d.set_item("namespaces", py.None())?,
+            }
+            match &r.visible_where {
+                Some(p) => d.set_item("visible_where", predicate_to_py(py, p)?)?,
+                None => d.set_item("visible_where", py.None())?,
+            }
+            out.append(d)?;
+        }
+        Ok(out.unbind())
+    }
+
     /// Write a durable snapshot and truncate the WAL tail.
     ///
     /// After `snapshot()`, the next `GraphDb.open()` on the same path loads
@@ -1442,6 +1500,66 @@ impl GraphDb {
     #[pyo3(text_signature = "($self)")]
     fn snapshot(&self) -> PyResult<()> {
         self.with_mut(|db| db.snapshot())
+    }
+
+    /// Seed the store directory `dst` from the backup `src`, and say what it
+    /// did.
+    ///
+    /// `src` is either a backup directory itself or a directory of them, in
+    /// which case a subdirectory named `latest` wins outright and otherwise the
+    /// newest by mtime does. The files are copied into a staging directory
+    /// inside `dst` and **opened there** — the same CRC and replay checks any
+    /// open runs — and only a copy that opened is moved into place, so a backup
+    /// that does not open leaves `dst` exactly as it was found.
+    ///
+    /// Returns a dict with `outcome`, one of:
+    ///
+    /// - `"restored"` — seeded, with `from`, `files` and `bytes` filled in;
+    /// - `"already_present"` — `dst` already holds a store. **It is refused,
+    ///   not merged**: nothing of the backup is copied over a live store;
+    /// - `"empty"` — nothing under `src` looks like a store. A first boot on an
+    ///   empty backup volume is a report, not a failure.
+    ///
+    /// So a caller that requires a fresh restore must read `outcome`; a sidecar
+    /// rebuilding on boot can ignore it and call this every time, which is what
+    /// `serve --restore-from` does.
+    ///
+    /// Raises `IoError` when a copy, an install or the staged open failed; the
+    /// message names both directories.
+    ///
+    /// ```python
+    /// GraphDb.restore("/backups", "/data/db")
+    /// db = GraphDb.open("/data/db")
+    /// ```
+    #[staticmethod]
+    #[pyo3(text_signature = "(src, dst)")]
+    fn restore(py: Python<'_>, src: PathBuf, dst: PathBuf) -> PyResult<Py<PyDict>> {
+        // Argument order is the caller's — source first, destination second —
+        // while the engine takes the destination first. Named bindings, so the
+        // pair cannot be swapped by editing one line.
+        let outcome = restore_if_empty(&dst, &src).map_err(graph_err)?;
+        let d = PyDict::new(py);
+        match outcome {
+            RestoreOutcome::Restored { from, files, bytes } => {
+                d.set_item("outcome", "restored")?;
+                d.set_item("from", from.to_string_lossy().as_ref())?;
+                d.set_item("files", files)?;
+                d.set_item("bytes", bytes)?;
+            }
+            RestoreOutcome::AlreadyPresent => {
+                d.set_item("outcome", "already_present")?;
+                d.set_item("from", py.None())?;
+                d.set_item("files", Vec::<String>::new())?;
+                d.set_item("bytes", 0u64)?;
+            }
+            RestoreOutcome::Empty => {
+                d.set_item("outcome", "empty")?;
+                d.set_item("from", py.None())?;
+                d.set_item("files", Vec::<String>::new())?;
+                d.set_item("bytes", 0u64)?;
+            }
+        }
+        Ok(d.unbind())
     }
 
     /// Close the handle and release the store.  Further calls raise
@@ -1784,6 +1902,30 @@ fn parse_algo_dir(s: &str) -> PyResult<AlgoDir> {
             "direction must be 'out', 'in', or 'both'",
         )),
     }
+}
+
+/// A [`PropPredicate`] as the dict `py_to_where` would read back.
+///
+/// Both legs are always present, `None` when unset, so a caller can index the
+/// dict without asking which form the role was written in.
+fn predicate_to_py(py: Python<'_>, p: &PropPredicate) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("field", &p.field)?;
+    match &p.eq {
+        Some(v) => d.set_item("eq", value_to_py(py, v)?)?,
+        None => d.set_item("eq", py.None())?,
+    }
+    match &p.in_ {
+        Some(values) => {
+            let list = PyList::empty(py);
+            for v in values {
+                list.append(value_to_py(py, v)?)?;
+            }
+            d.set_item("in", list)?;
+        }
+        None => d.set_item("in", py.None())?,
+    }
+    Ok(d.unbind())
 }
 
 fn py_to_where(dict: &Bound<'_, PyDict>) -> PyResult<PropPredicate> {

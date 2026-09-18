@@ -6,6 +6,7 @@ mod ingest;
 pub mod mask;
 pub mod reader;
 pub mod repograph;
+pub mod restore;
 pub mod roles;
 pub mod schema;
 mod shared;

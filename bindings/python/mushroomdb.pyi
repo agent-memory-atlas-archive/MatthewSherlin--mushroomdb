@@ -454,8 +454,40 @@ class GraphDb:
     def stats(self) -> dict[str, Any]:
         """Node/edge counts, `history_floor`, `namespaces`, and per-rule size, latch, and fires."""
 
+    def roles(self) -> list[dict[str, Any]]:
+        """The roles `roles.json` defines: `name`, `labels`, `keys`, `namespaces`, `visible_where`.
+
+        `namespaces` is `None` for a role bound to no namespace, which means
+        every one. `visible_where` is `None` or `{"field", "eq", "in"}`.
+
+        `[]` when no roles are defined, and **raises `Corrupt` when `roles.json`
+        was corrupt at open** — an unrestricted store answers `[]` too, so a
+        poisoned sidecar must not read as "nothing is restricted here". Refused
+        on a `scoped()` handle: a role definition names node keys, namespaces
+        and the other roles in the store.
+        """
+
     def snapshot(self) -> None:
         """Write a durable snapshot and truncate the WAL tail."""
+
+    @staticmethod
+    def restore(src: str | PathLike[str], dst: str | PathLike[str]) -> dict[str, Any]:
+        """Seed the store directory `dst` from the backup `src`, and say what it did.
+
+        `src` is a backup directory or a directory of them, where `latest` wins
+        outright and otherwise the newest by mtime does. The copy is staged
+        inside `dst` and opened there before anything is moved into place, so a
+        backup that does not open leaves `dst` as it was found.
+
+        Returns `{outcome, from, files, bytes}`. `outcome` is `"restored"`,
+        `"already_present"` — `dst` already holds a store, which is **refused,
+        not merged** — or `"empty"`, meaning nothing under `src` looks like a
+        store. A caller that requires a fresh restore must read it; a sidecar
+        rebuilding on boot can call this every time and ignore it.
+
+        Raises `IoError` when a copy, an install or the staged open failed; the
+        message names both directories.
+        """
 
     def refresh(self) -> int:
         """Apply other processes' commits; return how many were applied.

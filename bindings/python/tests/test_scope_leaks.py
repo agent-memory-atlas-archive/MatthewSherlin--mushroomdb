@@ -314,6 +314,52 @@ def test_schema_facts_stay_unscoped(store):
     assert s.has_vector_rule("emb") == db.has_vector_rule("emb")
 
 
+def test_roles_is_refused_on_a_scoped_handle(store):
+    """The role list is the one schema fact made of node data.
+
+    `has_vector_rule` and `is_index_enabled` answer unscoped because a field
+    name and an index flag name no node. A role definition names node keys
+    outright (`keys` is an administrative grant, spelled as keys), plus the
+    namespace roster `stats()` is at pains to narrow and the name of every other
+    role in the store. Narrowing it is no better: a `RoleDef` with its hidden
+    keys filtered out is not the definition, and a caller checking a role at
+    boot against a doctored copy is worse off than one that was refused.
+
+    So the whole surface is refused on a scoped handle, and the refusal names
+    the handle to call it on — the same shape as the write refusals below.
+    """
+    _db, s = store
+    with pytest.raises(ValueError) as err:
+        s.roles()
+    _assert_clean("roles refusal", str(err.value))
+    assert "scoped" in str(err.value)
+
+
+def test_restore_is_a_staticmethod_about_other_directories(tmp_path):
+    """`restore` is a staticmethod: `s.restore(a, b)` is `GraphDb.restore(a, b)`.
+
+    Like `open`, it is on a scoped handle only because Python puts every
+    staticmethod on every instance. It names two other directories and says
+    nothing about this store, so it has no scoped contract to leak — that is
+    the row.
+    """
+    db = GraphDb.open(str(tmp_path / "live"))
+    db.insert_node("Person", "hidden_x", {})
+    s = db.scoped(keys=list(VISIBLE))
+
+    donor = GraphDb.open(str(tmp_path / "donor"))
+    donor.insert_node("Person", "donated", {})
+    donor.snapshot()
+    donor.close()
+
+    assert s.restore(str(tmp_path / "donor"), str(tmp_path / "fresh"))["outcome"] == "restored"
+    other = GraphDb.open(str(tmp_path / "fresh"))
+    assert other.node_info("donated") is not None, "a different store, not this one"
+    assert other.node_info("hidden_x") is None
+    other.close()
+    db.close()
+
+
 def test_wal_total_commits_is_a_store_fact(store):
     """Store-wide, like `stats()`'s counts: a frame count names no node."""
     db, s = store
@@ -510,11 +556,14 @@ COVERED = {
     "has_vector_rule": "test_schema_facts_stay_unscoped",
     "is_index_enabled": "test_schema_facts_stay_unscoped",
     "wal_total_commits": "test_wal_total_commits_is_a_store_fact",
+    # refused outright: schema made of node data, with no honest narrowing
+    "roles": "test_roles_is_refused_on_a_scoped_handle",
     # permitted non-writes
     "refresh": "test_refresh_is_permitted_and_names_nothing",
     "scoped": "test_scoped_narrows_and_never_widens",
     "close": "test_close_is_permitted_on_a_scoped_handle",
     "open": "test_open_carries_no_scope_and_reads_no_other_store",
+    "restore": "test_restore_is_a_staticmethod_about_other_directories",
     # writes — refused, and the refusal discloses nothing
     "insert_node": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "upsert_node": "test_upsert_node_is_not_an_existence_or_label_oracle",

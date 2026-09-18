@@ -1789,6 +1789,17 @@ pub struct WriteAuthz {
     pub mask: crate::mask::NodeMask,
 }
 
+/// The error every role surface gives when `roles.json` did not parse at open.
+///
+/// One text, so `mask_for_role` and [`GraphDb::roles_checked`] cannot drift
+/// apart on the same cause.
+fn roles_poisoned() -> GraphError {
+    GraphError::Corrupt {
+        detail: "roles.json was corrupt at open; fix the file and re-open to restore role access"
+            .into(),
+    }
+}
+
 /// Write `bytes` to `snapshot.bin.bak` atomically with full fsync.
 ///
 /// Uses [`RealFs::write_atomic`] which applies `F_FULLFSYNC` on macOS and
@@ -7607,11 +7618,7 @@ impl<F: Fs> GraphDb<F> {
 
     /// Resolve `role` against the current graph, ignoring the memo.
     fn build_mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
-        let roles = self.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
-            detail:
-                "roles.json was corrupt at open; fix the file and re-open to restore role access"
-                    .into(),
-        })?;
+        let roles = self.roles.as_ref().ok_or_else(roles_poisoned)?;
         let def = roles
             .iter()
             .find(|r| r.name == role)
@@ -7672,9 +7679,29 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Returns an empty list when no roles are defined or when `roles.json`
     /// was corrupt at open (check [`mask_for_role`](Self::mask_for_role) for
-    /// the fail-loud error in that case).
+    /// the fail-loud error in that case, or call
+    /// [`roles_checked`](Self::roles_checked), which is this readout with that
+    /// error in it).
     pub fn roles(&self) -> Vec<RoleDef> {
         self.roles.as_deref().unwrap_or(&[]).to_vec()
+    }
+
+    /// The role definitions, or the poison error when `roles.json` was corrupt
+    /// at open.
+    ///
+    /// [`roles`](Self::roles) answers `[]` both for a store that defines no
+    /// roles and for one whose sidecar did not parse, and a caller validating a
+    /// role name at boot cannot tell those apart. The wrong reading of the pair
+    /// is the dangerous one: a store with no roles at all is an unrestricted
+    /// store, so a poisoned file would read as "nothing is restricted here".
+    ///
+    /// This is the same answer, for the same cause, that
+    /// [`mask_for_role`](Self::mask_for_role) gives on the first read.
+    pub fn roles_checked(&self) -> Result<Vec<RoleDef>> {
+        match self.roles.as_deref() {
+            Some(roles) => Ok(roles.to_vec()),
+            None => Err(roles_poisoned()),
+        }
     }
 
     // ── Role-scoped write authz ───────────────────────────────────────────────

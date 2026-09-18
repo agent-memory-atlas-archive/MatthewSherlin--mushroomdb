@@ -1440,7 +1440,7 @@ fn graph_tools() -> Vec<Js> {
                         "field": { "type": "string", "description": "Property field holding the embedding vectors (default: embedding). Used in vector-search mode." },
                         "label": { "type": "string", "description": "Restrict search to nodes with this label. Empty string means all labels. Used in vector-search mode." },
                         "k": { "type": "integer", "description": "Maximum results to return in vector-search mode (default: 10)." },
-                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8)." },
+                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8). The Python binding's find_similar defaults this to 0.0 instead — same operation, same name, different default, so name it explicitly when a call has to agree across both surfaces." },
                         "mask": {
                             "type": "array",
                             "items": { "type": "string" },

@@ -1649,6 +1649,20 @@ pub struct GraphDb<F: Fs> {
     ///
     /// Persisted via the `wal.genesis` marker file; loaded from it at open.
     archive_genesis_chain: bool,
+    /// True when this handle can *prove* the live WAL has never been truncated:
+    /// there was no `snapshot.bin` when it opened the store, and it has taken no
+    /// truncating snapshot since.
+    ///
+    /// The archive path's genesis check asks "did a snapshot exist before this
+    /// one?" as a proxy for "was the WAL ever truncated". The proxy is sound
+    /// across sessions — this binary cannot tell a history-preserving snapshot
+    /// from a truncating one once the handle that took it is gone — but inside
+    /// one session it is not, and `enable_multiplicity` made that visible: its
+    /// forced `keep_wal` snapshot left the WAL entirely intact and yet
+    /// permanently disqualified the store from ever receiving a genesis marker
+    /// (defect #23). This flag is what the proxy defers to when the answer is
+    /// actually known.
+    snapshot_preserved_history: bool,
     /// Transient write-authz context set by `write_batch_authz` /
     /// `query_write_authz` for the duration of ONE mutation call.
     /// Always `None` at rest.  Never serialized, never WAL-replayed.
@@ -2277,6 +2291,8 @@ impl<F: Fs> GraphDb<F> {
             wal_archive_retention: None,
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
+            // Nothing is proven until `load_from_disk` has looked at the store.
+            snapshot_preserved_history: false,
             pending_write_authz: None,
             slow_query_threshold_ms: std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
                 .ok()
@@ -2343,6 +2359,8 @@ impl<F: Fs> GraphDb<F> {
         self.last_change = HashMap::new();
         self.wal_horizon_floor = 0;
         self.archive_genesis_chain = false;
+        // Re-derived by `load_from_disk` from the store it is about to read.
+        self.snapshot_preserved_history = false;
         self.pending_write_authz = None;
         self.wal_consumed = 0;
         self.snapshot_ident = None;
@@ -2393,6 +2411,17 @@ impl<F: Fs> GraphDb<F> {
                 snap_header[4],
                 snap_header[5],
             ]));
+        // The version this store is stamped with, or `None` when it has never
+        // been snapshotted. Read from the same six bytes, with no second read.
+        let snapshot_version = if snap_header.len() >= 6 && &snap_header[0..4] == b"GDB1" {
+            Some(u16::from_le_bytes([snap_header[4], snap_header[5]]))
+        } else {
+            None
+        };
+        // No snapshot means no snapshot has ever truncated the WAL, so this
+        // handle can prove the history is whole. Once a snapshot exists that
+        // this handle did not take, it cannot: see `snapshot_preserved_history`.
+        db.snapshot_preserved_history = snap_header.is_empty();
         if is_v8 {
             // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
             // No 2.4GB heap Vec is allocated on RealFs.
@@ -2461,6 +2490,35 @@ impl<F: Fs> GraphDb<F> {
             trace_open!("lazy sections loaded (WAL path)", _t0);
         }
         let replayed = db.apply_frames(records)?;
+        // ── The multiplicity declaration, recovered from the stamp ───────────
+        //
+        // The opt-in is re-emitted into every baseline WAL a snapshot writes, so
+        // ordinarily the replay above has already found it. But
+        // `snapshot_with(archive_wal)` renames the live WAL away and writes its
+        // replacement afterwards, and between those two points the store holds
+        // no live declaration at all. A crash there — or a single `Err` from any
+        // call in between — used to opt the store back out on the next open
+        // (defect #22): it would stop counting and write a **V9** snapshot while
+        // the archives still carried discriminant 23, which is the exact state
+        // the V10 stamp exists to prevent.
+        //
+        // The stamp closes it, and closes it by construction rather than by
+        // narrowing a window. An archive exists only because `snapshot_with`
+        // took one, and that same call stamps the snapshot from `multiplicity`
+        // *before* it touches the WAL. So a V10 snapshot standing next to an
+        // archive is proof the store was opted in when the archive was made, and
+        // therefore that the archived WAL carries the declaration — whatever
+        // became of the live one. No ordering inside the archive sequence, and
+        // no crash within it, can make that evidence disagree.
+        //
+        // `list_archives` is only reached on a store already stamped V10 whose
+        // WAL did not declare, which is the interrupted case and nothing else.
+        if !db.multiplicity
+            && snapshot_version == Some(core_storage::snapshot::VERSION_10)
+            && !db.fs.list_archives()?.is_empty()
+        {
+            db.multiplicity = true;
+        }
         // The cursor sits at the end of the valid prefix, not the end of the
         // file: a torn or still-being-written tail is unconsumed by definition
         // and stays visible to `is_stale` until it decodes.
@@ -4467,6 +4525,14 @@ impl<F: Fs> GraphDb<F> {
     /// output are rolled back, so a later successful mutation cannot log an
     /// `Intern` record whose id replay would never reproduce.
     fn rewrite_wal_dense(&mut self, recs: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+        self.rewrite_wal_dense_planned(recs.into_iter().map(PlannedRec::Rec).collect())
+    }
+
+    /// [`rewrite_wal_dense`](Self::rewrite_wal_dense) for a frame that still
+    /// carries [`PlannedRec::DuplicateCount`] entries — the shape a batch
+    /// produces, where a duplicate's count can only be named once this pass has
+    /// assigned the frame's own ids.
+    fn rewrite_wal_dense_planned(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
         let syms_checkpoint = self.syms.len();
         let result = self.rewrite_wal_dense_inner(recs);
         if result.is_err() {
@@ -4475,7 +4541,7 @@ impl<F: Fs> GraphDb<F> {
         result
     }
 
-    fn rewrite_wal_dense_inner(&mut self, recs: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+    fn rewrite_wal_dense_inner(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
         let mut out = Vec::with_capacity(recs.len());
         // Node ids allocated by later apply(InsertNodeId) in this same batch.
         let mut pending: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -4488,11 +4554,62 @@ impl<F: Fs> GraphDb<F> {
         let mut next = u32::try_from(self.ids.len()).map_err(|_| GraphError::Corrupt {
             detail: "id space exhausted".into(),
         })?;
+        // Insert counts this frame has already raised. `edge_insert_count`
+        // reads committed state, which cannot see a count queued earlier in
+        // this same frame, so N duplicates of one pair would otherwise all
+        // compute `committed + 1` and the last would win.
+        let mut pending_counts: HashMap<(u32, u32, u32), u64> = HashMap::new();
         let lookup = |ids: &IdMap,
                       pending: &std::collections::HashMap<String, u32>,
                       key: &str|
          -> Option<u32> { ids.get(key).or_else(|| pending.get(key).copied()) };
         for rec in recs {
+            // A duplicate insert's count, resolved here and nowhere else.
+            //
+            // This is the only pass that knows the frame's own ids: a node
+            // created earlier in the same frame has no dense id until the
+            // `InsertNodeId` above allocates one, and an edge type first used in
+            // this frame is not in `syms` until `intern_wal` puts it there.
+            // Resolving the count in the batch's validate pass instead — where
+            // it used to live — meant that a duplicate whose endpoints or type
+            // were created in the same frame silently produced no count at all,
+            // which is exactly the shape a mirror rebuild writes (defect #24).
+            let rec = match rec {
+                PlannedRec::Rec(rec) => rec,
+                PlannedRec::DuplicateCount {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                } => {
+                    let (etype, intern) = self.intern_wal(&edge_type);
+                    if interned.insert(etype) {
+                        out.push(intern);
+                    }
+                    let src = lookup(&self.ids, &pending, &src_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing src {src_key}"),
+                        }
+                    })?;
+                    let dst = lookup(&self.ids, &pending, &dst_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing dst {dst_key}"),
+                        }
+                    })?;
+                    let count = pending_counts
+                        .get(&(etype, src, dst))
+                        .copied()
+                        .unwrap_or_else(|| self.edge_insert_count(etype, src, dst))
+                        .saturating_add(1);
+                    pending_counts.insert((etype, src, dst), count);
+                    out.push(WalRecord::SetEdgeCount {
+                        etype,
+                        src,
+                        dst,
+                        count,
+                    });
+                    continue;
+                }
+            };
             match rec {
                 WalRecord::InsertNode { label, key, props } => {
                     // Namespace validation and normalisation, on the one seam
@@ -5825,11 +5942,12 @@ impl<F: Fs> GraphDb<F> {
             // out what it removes. Resolved on the first `Replace` in the frame
             // and reused, so N replaces read the field list once, not N times.
             let mut store_fields: Option<Vec<String>> = None;
-            // Insert counts raised earlier in *this* frame. `edge_count_record`
-            // reads committed state, which cannot see a count this frame has
-            // already queued, so three duplicates in one batch would otherwise
-            // all compute the same number and the last would win.
-            let mut pending_counts: HashMap<(u32, u32, u32), u64> = HashMap::new();
+            // Duplicate inserts this frame has to count, each paired with the
+            // position in `recs` it belongs at. The count itself is named in the
+            // dense rewrite and not here: a duplicate's endpoints and edge type
+            // may all be created by earlier ops in this same frame, and nothing
+            // in the frame has a dense id yet. See [`PlannedRec`].
+            let mut deferred_counts: Vec<(usize, String, String, String)> = Vec::new();
             for op in ops {
                 match op {
                     BatchOp::InsertNode { label, key, props } => {
@@ -5913,18 +6031,17 @@ impl<F: Fs> GraphDb<F> {
                                 src_key,
                                 dst_key,
                             });
-                        } else if let Some(rec) = preview.db.edge_count_record_pending(
-                            &edge_type,
-                            &src_key,
-                            &dst_key,
-                            &mut pending_counts,
-                        ) {
+                        } else if preview.db.multiplicity {
                             // A duplicate inside a batch counts the way a
                             // duplicate through `insert_edge` does: `ingest` and
                             // Cypher `CREATE` reach this choke-point and not
                             // that one, and a count only one entry point keeps
                             // would be worse than no count at all.
-                            recs.push(rec);
+                            //
+                            // This is the one gate on discriminant 23 from the
+                            // batch path: a store that never opted in queues
+                            // nothing here and so writes no such record.
+                            deferred_counts.push((recs.len(), edge_type, src_key, dst_key));
                         }
                     }
                     BatchOp::SetProp { key, field, value } => {
@@ -6009,23 +6126,40 @@ impl<F: Fs> GraphDb<F> {
                                 src_key,
                                 dst_key,
                             });
-                        } else if let Some(rec) = preview.db.edge_count_record_pending(
-                            &edge_type,
-                            &src_key,
-                            &dst_key,
-                            &mut pending_counts,
-                        ) {
-                            // A duplicate inside a batch counts the way a
-                            // duplicate through `insert_edge` does: `ingest` and
-                            // Cypher `CREATE` reach this choke-point and not
-                            // that one, and a count only one entry point keeps
-                            // would be worse than no count at all.
-                            recs.push(rec);
+                        } else if preview.db.multiplicity {
+                            // Same choke-point, same gate as `BatchOp::InsertEdge`
+                            // above: an upsert that finds the pair already there
+                            // is a duplicate insert and counts as one.
+                            deferred_counts.push((recs.len(), edge_type, src_key, dst_key));
                         }
                     }
                 }
             }
-            recs
+            // Splice the deferred counts back into the positions they were
+            // raised at, so a count still sits exactly where the duplicate did
+            // — before any later op in the frame that deletes the pair.
+            let mut planned: Vec<PlannedRec> =
+                Vec::with_capacity(recs.len() + deferred_counts.len());
+            let mut deferred = deferred_counts.into_iter().peekable();
+            for (i, rec) in recs.into_iter().enumerate() {
+                while deferred.peek().is_some_and(|(at, ..)| *at == i) {
+                    let (_, edge_type, src_key, dst_key) = deferred.next().expect("just peeked");
+                    planned.push(PlannedRec::DuplicateCount {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    });
+                }
+                planned.push(PlannedRec::Rec(rec));
+            }
+            for (_, edge_type, src_key, dst_key) in deferred {
+                planned.push(PlannedRec::DuplicateCount {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                });
+            }
+            planned
         };
         // A frame that is nothing but skips or refused rows writes no WAL, but
         // it still has counts to report, so the early returns carry `outcome`
@@ -6035,7 +6169,7 @@ impl<F: Fs> GraphDb<F> {
         }
         // rewrite_wal_dense converts every InsertNode/InsertEdge into its
         // *Id form, so only the dense variants can appear in `recs` here.
-        let recs = self.rewrite_wal_dense(recs)?;
+        let recs = self.rewrite_wal_dense_planned(recs)?;
         // The rewrite can empty a non-empty batch: a `SET n.ns` naming the
         // namespace the node is already in is a no-op and is dropped there. An
         // empty `Batch` frame would still take a commit sequence and a WAL
@@ -6872,6 +7006,21 @@ impl<F: Fs> GraphDb<F> {
     /// reachable. On a large store the call therefore costs one full snapshot
     /// write.
     ///
+    /// # What it costs a store that archives
+    ///
+    /// Writing `snapshot.bin` is also how the archive path decides whether the
+    /// store may have a *genesis chain* — whether `open_at` can replay
+    /// archive-resident commits from empty state. The rule is conservative: a
+    /// snapshot that was already on disk might have been a truncating one, and
+    /// once the handle that took it is gone this binary cannot tell. A
+    /// `keep_wal` snapshot taken by **this** handle is the case where it can, so
+    /// opting in and then archiving **in the same session** keeps the chain.
+    ///
+    /// Opting in, closing the store, and archiving in a *later* session does
+    /// not — but that is the answer any store with a prior snapshot gets, not
+    /// something this call causes. A store that wants the chain should take its
+    /// first archive in the session that opted in.
+    ///
     /// Calling it on a store that has already opted in writes nothing and
     /// returns `Ok(())`: an operator should not have to ask first.
     ///
@@ -6879,7 +7028,8 @@ impl<F: Fs> GraphDb<F> {
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
     /// - Anything [`snapshot_with`](Self::snapshot_with) can return: the store
     ///   is left opted *out* (a V10 snapshot may remain on disk, which only
-    ///   costs an older reader a refusal it did not strictly need).
+    ///   costs an older reader a refusal it did not strictly need, and which the
+    ///   next snapshot rewrites at V9).
     pub fn enable_multiplicity(&mut self) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -6942,11 +7092,16 @@ impl<F: Fs> GraphDb<F> {
     /// The `SetEdgeCount` record a duplicate insert of `(edge_type, src_key,
     /// dst_key)` should log, or `None` when nothing should be written.
     ///
-    /// `None` covers three cases, and the first is the one that matters: the
-    /// store has not opted in, so **no discriminant-23 record is written at
-    /// all**. The other two are a pair whose etype or endpoints are not yet
-    /// interned — which, for a duplicate of an existing pair, means the pair
-    /// was created earlier in this same batch and has no dense id to name yet.
+    /// `None` when the store has not opted in, so **no discriminant-23 record
+    /// is written at all** — the gate the whole feature rests on.
+    ///
+    /// The other two `None`s are unreachable from the one caller. This is the
+    /// single-mutation path, where `prepare_insert_edge` has already refused a
+    /// missing endpoint and an existing pair's edge type is necessarily
+    /// interned. A batch is the case where a pair's endpoints and type can all
+    /// be created by the same frame, and it does not come through here: it
+    /// queues a [`PlannedRec::DuplicateCount`] and names the count in the dense
+    /// rewrite, which is the only pass that knows the frame's own ids.
     fn edge_count_record(
         &self,
         edge_type: &str,
@@ -6964,40 +7119,6 @@ impl<F: Fs> GraphDb<F> {
             src,
             dst,
             count: self.edge_insert_count(etype, src, dst).saturating_add(1),
-        })
-    }
-
-    /// [`edge_count_record`](Self::edge_count_record) for a batch, where the
-    /// counts this frame has already queued are not yet in committed state.
-    ///
-    /// `pending` carries them forward, so N duplicates of one pair in one frame
-    /// end on `committed + N` rather than all computing `committed + 1`.
-    fn edge_count_record_pending(
-        &self,
-        edge_type: &str,
-        src_key: &str,
-        dst_key: &str,
-        pending: &mut HashMap<(u32, u32, u32), u64>,
-    ) -> Option<WalRecord> {
-        let WalRecord::SetEdgeCount {
-            etype,
-            src,
-            dst,
-            count,
-        } = self.edge_count_record(edge_type, src_key, dst_key)?
-        else {
-            return None;
-        };
-        let next = match pending.get(&(etype, src, dst)) {
-            Some(queued) => queued.saturating_add(1),
-            None => count,
-        };
-        pending.insert((etype, src, dst), next);
-        Some(WalRecord::SetEdgeCount {
-            etype,
-            src,
-            dst,
-            count: next,
         })
     }
 
@@ -12875,7 +12996,15 @@ impl<F: Fs> GraphDb<F> {
         // legacy store (may have been truncated in an older code version) from a
         // new store that only used keep_wal=true.  Conservative: refuse genesis in
         // both cases.  Must be sampled here, before the snapshot write below.
-        let had_prior_snapshot = self.fs.snapshot_path().map(|p| p.exists()).unwrap_or(false);
+        //
+        // `snapshot_preserved_history` is the one case where the answer is not a
+        // guess: a snapshot *this handle* took, on a store that had none when it
+        // opened, and that kept the WAL. The proxy defers to it, because
+        // otherwise `enable_multiplicity` — whose forced snapshot is exactly
+        // that — would permanently disqualify the store from a genesis chain it
+        // is fully entitled to (defect #23).
+        let had_prior_snapshot = self.fs.snapshot_path().map(|p| p.exists()).unwrap_or(false)
+            && !self.snapshot_preserved_history;
         // Which version this store writes. V9 unless it has opted in to
         // multiplicity, in which case V10 — the stamp that makes a reader which
         // does not know WAL discriminant 23 refuse the open instead of
@@ -13131,6 +13260,46 @@ impl<F: Fs> GraphDb<F> {
                 + live_frames_for_name.len() as u64;
             self.fs.archive_wal(archive_n)?;
 
+            // The replacement WAL goes in **immediately**, with no fallible call
+            // between it and the rename above.
+            //
+            // The rename is what removes the store's live declarations — the
+            // multiplicity opt-in, and every `EnableFulltext` / `EnableIndex` —
+            // and this write is what puts them back. Every call that used to sit
+            // in between (the genesis marker, the retention sweep's reads, the
+            // floor write, the archive deletes) was a `?` that could leave the
+            // store with neither, so a single transient `Err` was enough to lose
+            // a declaration that no rebuild can recover (defect #22).
+            //
+            // Ordering alone cannot close the crash window between two
+            // filesystem calls; for the multiplicity declaration the V10 stamp
+            // does that on the open path. What ordering does close is the much
+            // wider window in which an ordinary I/O error did it — and that half
+            // covers all three declarations, not just the one with a stamp.
+            let mut baseline_wal: Vec<u8> = Vec::new();
+            // The multiplicity opt-in is a declaration like the two below it,
+            // and it is re-emitted for the same reason: truncation must not
+            // silently opt the store back out and stop counting.
+            if self.multiplicity {
+                baseline_wal
+                    .extend_from_slice(&encode_record(&core_storage::wal::MULTIPLICITY_ENABLED));
+            }
+            for (label, field) in self.fulltext.enabled_pairs() {
+                let rec = WalRecord::EnableFulltext {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            for (label, field) in self.prop_index.enabled_pairs() {
+                let rec = WalRecord::EnableIndex {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
+
             // Genesis marker: written once when the first archive is taken
             // from a store that has never undergone a WAL-truncating snapshot.
             // When present, `open_at` may replay archive-resident commits from
@@ -13148,6 +13317,11 @@ impl<F: Fs> GraphDb<F> {
             //      may have truncated the WAL), the same conservative refusal applies:
             //      we cannot prove the chain is complete, so we refuse genesis (cost =
             //      no as-of-through-archives; never silent wrong data).
+            //      The one exception is a snapshot this handle took itself, on a store
+            //      that had none when it opened, with the WAL kept: there the answer is
+            //      known rather than guessed, and `snapshot_preserved_history` says so.
+            //      Without that exception `enable_multiplicity`'s forced keep_wal
+            //      snapshot would disqualify the store forever (defect #23).
             //      On SimFs (snapshot_path() == None) had_prior_snapshot is always false,
             //      so SimFs always passes this check.
             if is_first_archive && !had_prior_snapshot {
@@ -13200,31 +13374,6 @@ impl<F: Fs> GraphDb<F> {
                     }
                 }
             }
-
-            // Write new minimal baseline WAL (mirrors the keep_wal=false path).
-            let mut baseline_wal: Vec<u8> = Vec::new();
-            // The multiplicity opt-in is a declaration like the two below it,
-            // and it is re-emitted for the same reason: truncation must not
-            // silently opt the store back out and stop counting.
-            if self.multiplicity {
-                baseline_wal
-                    .extend_from_slice(&encode_record(&core_storage::wal::MULTIPLICITY_ENABLED));
-            }
-            for (label, field) in self.fulltext.enabled_pairs() {
-                let rec = WalRecord::EnableFulltext {
-                    label: label.clone(),
-                    field: field.clone(),
-                };
-                baseline_wal.extend_from_slice(&encode_record(&rec));
-            }
-            for (label, field) in self.prop_index.enabled_pairs() {
-                let rec = WalRecord::EnableIndex {
-                    label: label.clone(),
-                    field: field.clone(),
-                };
-                baseline_wal.extend_from_slice(&encode_record(&rec));
-            }
-            self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
         } else if opts.keep_wal {
             // keep_wal=true: WAL is left untouched.  The existing WAL already
             // contains the EnableFulltext records from the original enable calls;
@@ -13252,6 +13401,10 @@ impl<F: Fs> GraphDb<F> {
                 self.fs.delete_genesis_marker()?;
                 self.archive_genesis_chain = false;
             }
+            // And this handle can no longer prove the WAL is whole: it is about
+            // to truncate it itself. Same-session archives after this point get
+            // the conservative answer, exactly as cross-session ones do.
+            self.snapshot_preserved_history = false;
             let mut baseline_wal: Vec<u8> = Vec::new();
             // The multiplicity opt-in is a declaration like the two below it,
             // and it is re-emitted for the same reason: truncation must not
@@ -13373,6 +13526,24 @@ pub struct BatchOutcome {
 /// produces a [`BatchOutcome`].
 fn inserted_pair(outcome: BatchOutcome) -> (usize, usize) {
     (outcome.nodes_inserted, outcome.edges_inserted)
+}
+
+/// One entry of a frame the validate pass has decided on, before
+/// [`GraphDb::rewrite_wal_dense_planned`] turns it into dense-id records.
+///
+/// Almost every entry is already a finished [`WalRecord`]. The exception is a
+/// duplicate edge insert: its count names a dense triple, and on the batch path
+/// the endpoints and the edge type may all be created by earlier records in the
+/// *same* frame, so no id for them exists until the dense rewrite allocates it.
+/// Carrying the keys this far and resolving them there is what lets the count
+/// survive the shape a mirror rebuild writes (defect #24).
+enum PlannedRec {
+    Rec(WalRecord),
+    DuplicateCount {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
 }
 
 /// Queued mutation for a [`BatchBuilder`] or [`GraphDb::commit_group`].

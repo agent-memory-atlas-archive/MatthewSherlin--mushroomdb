@@ -485,7 +485,16 @@ class GraphDb:
         know, and it takes it **before** writing the record. A 0.6.9 binary
         stops at `snapshot: unsupported version 10` and leaves the WAL exactly
         as it found it. The cost is one full snapshot write; the snapshot keeps
-        the WAL, so history stays reachable.
+        the WAL, so every commit `open_at` could reach before the call it can
+        still reach after it.
+
+        One thing the snapshot does move: a store that archives its WAL decides
+        at its **first** archive whether `open_at` may reach into archives, and
+        it says no whenever a snapshot it cannot vouch for already exists. A
+        snapshot this handle took itself, keeping the WAL, is one it can vouch
+        for — so opting in and taking that first archive in the *same* session
+        keeps that reach. Across sessions it does not, which is the answer any
+        store with a prior snapshot gets.
 
         A store that never calls this contains no such record, keeps writing
         the old snapshot version, and stays readable by 0.6.9 indefinitely.

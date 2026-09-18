@@ -5,7 +5,7 @@ use core_api::{
     Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 use std::collections::BTreeMap;
@@ -1500,12 +1500,13 @@ impl GraphDb {
 
     /// Refuse the call when this handle came from `scoped()`.
     ///
-    /// Task 7 gives this its own `MushroomReadOnly` class; until then it is a
-    /// `RuntimeError`, which every existing `except RuntimeError` already
-    /// catches.
+    /// Raises `ReadOnly`, the same class an as-of instance's refused write
+    /// raises: both say "this handle never writes". The message is unchanged,
+    /// and `ReadOnly` is a `RuntimeError`, so every existing `except` still
+    /// catches it.
     fn refuse_if_scoped(&self) -> PyResult<()> {
         if self.scope.is_some() {
-            return Err(PyRuntimeError::new_err(
+            return Err(ReadOnly::new_err(
                 "this handle is scoped, and a scoped handle never writes; call this on the \
                  handle scoped() was called on",
             ));
@@ -1652,14 +1653,118 @@ fn lock<T>(m: &Mutex<T>) -> PyResult<std::sync::MutexGuard<'_, T>> {
         .map_err(|_| PyRuntimeError::new_err("GraphDb lock poisoned"))
 }
 
-fn graph_err(e: GraphError) -> PyErr {
-    match e {
-        GraphError::QueryError { detail } => PyRuntimeError::new_err(detail),
-        // Busy gets its own exception type: it is the one error a caller is
-        // expected to catch and retry, and matching on a message is not an API.
-        busy @ GraphError::Busy { .. } => MushroomBusy::new_err(busy.to_string()),
-        other => PyRuntimeError::new_err(other.to_string()),
+/// Hang the failing variant's own fields on the exception instance.
+///
+/// `setattr` on a fresh exception instance can only fail on allocation
+/// failure; if it ever does, that error is what the caller sees.
+fn err_with<'py>(
+    py: Python<'py>,
+    err: PyErr,
+    set: impl FnOnce(&Bound<'py, PyBaseException>) -> PyResult<()>,
+) -> PyErr {
+    match set(err.value(py)) {
+        Ok(()) => err,
+        Err(fail) => fail,
     }
+}
+
+/// Map an engine error onto its Python class.
+///
+/// One class per `GraphError` variant, each a `MushroomError` and so a
+/// `RuntimeError`. The message is the one the engine has always produced, so
+/// existing logs and substring checks do not change; the fields the variant
+/// carries become attributes, so nobody has to parse that message.
+fn graph_err(e: GraphError) -> PyErr {
+    Python::attach(|py| {
+        let msg = match &e {
+            // A Python caller has never seen the `query error: ` prefix.
+            GraphError::QueryError { detail } => detail.clone(),
+            other => other.to_string(),
+        };
+        match &e {
+            GraphError::KeyNotFound { key } => err_with(py, KeyNotFound::new_err(msg), |v| {
+                v.setattr("key", key.as_str())
+            }),
+            GraphError::DuplicateKey { key } => err_with(py, DuplicateKey::new_err(msg), |v| {
+                v.setattr("key", key.as_str())
+            }),
+            // The variant's one field is an unnamed `std::io::Error`, whose
+            // own text is already the message.
+            GraphError::Io(_) => IoError::new_err(msg),
+            GraphError::Corrupt { detail } => err_with(py, Corrupt::new_err(msg), |v| {
+                v.setattr("detail", detail.as_str())
+            }),
+            GraphError::RuleInvalid { detail } => err_with(py, RuleInvalid::new_err(msg), |v| {
+                v.setattr("detail", detail.as_str())
+            }),
+            GraphError::RuleOwned { detail } => err_with(py, RuleOwned::new_err(msg), |v| {
+                v.setattr("detail", detail.as_str())
+            }),
+            GraphError::RuleNotFound { name } => err_with(py, RuleNotFound::new_err(msg), |v| {
+                v.setattr("name", name.as_str())
+            }),
+            GraphError::QueryError { detail } => err_with(py, QueryError::new_err(msg), |v| {
+                v.setattr("detail", detail.as_str())
+            }),
+            GraphError::IngestError { detail } => err_with(py, IngestError::new_err(msg), |v| {
+                v.setattr("detail", detail.as_str())
+            }),
+            GraphError::ReadOnly => ReadOnly::new_err(msg),
+            GraphError::CommitOutOfRange {
+                commit,
+                total,
+                floor,
+            } => err_with(py, CommitOutOfRange::new_err(msg), |v| {
+                v.setattr("commit", *commit)?;
+                v.setattr("total", *total)?;
+                v.setattr("floor", *floor)
+            }),
+            GraphError::ViewPropReadOnly { view_name } => {
+                err_with(py, ViewPropReadOnly::new_err(msg), |v| {
+                    v.setattr("view_name", view_name.as_str())
+                })
+            }
+            GraphError::CasConflict {
+                key,
+                expected,
+                actual,
+            } => err_with(py, CasConflict::new_err(msg), |v| {
+                v.setattr("key", key.as_str())?;
+                v.setattr("expected", *expected)?;
+                v.setattr("actual", *actual)
+            }),
+            GraphError::MaskedReadOnly => MaskedReadOnly::new_err(msg),
+            GraphError::RoleWriteDenied { reason } => {
+                err_with(py, RoleWriteDenied::new_err(msg), |v| {
+                    v.setattr("reason", reason.as_str())
+                })
+            }
+            // Busy is the one error a caller is expected to catch and retry,
+            // and matching on a message is not an API.
+            GraphError::Busy { holder } => err_with(py, MushroomBusy::new_err(msg), |v| {
+                v.setattr("holder", *holder)
+            }),
+            GraphError::NamespaceImmutable { key, from, to } => {
+                err_with(py, NamespaceImmutable::new_err(msg), |v| {
+                    v.setattr("key", key.as_str())?;
+                    // `from` is a Python keyword, so it cannot be an attribute.
+                    v.setattr("from_", from.as_str())?;
+                    v.setattr("to", to.as_str())
+                })
+            }
+            GraphError::CrossNamespace {
+                src,
+                src_ns,
+                dst,
+                dst_ns,
+            } => err_with(py, CrossNamespace::new_err(msg), |v| {
+                v.setattr("src", src.as_str())?;
+                v.setattr("src_ns", src_ns.as_str())?;
+                v.setattr("dst", dst.as_str())?;
+                v.setattr("dst_ns", dst_ns.as_str())
+            }),
+        }
+    })
 }
 
 fn parse_dir(s: &str) -> PyResult<Direction> {
@@ -2034,18 +2139,71 @@ fn summary_to_py(py: Python<'_>, s: &PredicateSummary) -> PyResult<Py<PyDict>> {
     Ok(d.unbind())
 }
 
+// ---------------------------------------------------------------------------
+// Error classes — one per `GraphError` variant (v0.6.10 §5.7)
+// ---------------------------------------------------------------------------
+
 pyo3::create_exception!(
     mushroomdb,
-    MushroomBusy,
+    MushroomError,
     PyRuntimeError,
-    "Another process holds the store's write lock.\n\n\
-     Nothing was written, so retrying later is always safe. Raised only by \
-     write calls: opening read-only and reading never take the lock."
+    "Base class for every error the engine raises.\n\n\
+     It subclasses `RuntimeError`, so every `except RuntimeError` written \
+     against an earlier release keeps catching exactly what it caught.\n\n\
+     Each subclass carries `.code`, a stable snake_case string, and the \
+     failing variant's own fields as attributes. `.code` is the compatibility \
+     surface: classes may be added, a code is never respelled. `str(e)` is \
+     the message the engine has always produced."
 );
+
+/// Declare one exception class per `GraphError` variant and register them.
+///
+/// The `.code` is set on the class object, so it reads the same off the class
+/// (`mushroomdb.KeyNotFound.code`) and off a caught instance (`e.code`).
+macro_rules! engine_errors {
+    ($($class:ident, $code:literal, $doc:literal;)*) => {
+        $(pyo3::create_exception!(mushroomdb, $class, MushroomError, $doc);)*
+
+        fn register_errors(m: &Bound<'_, PyModule>) -> PyResult<()> {
+            let py = m.py();
+            let base = py.get_type::<MushroomError>();
+            // The base is never raised, so it names no variant and no code.
+            base.setattr("code", py.None())?;
+            m.add("MushroomError", base)?;
+            $(
+                let ty = py.get_type::<$class>();
+                ty.setattr("code", $code)?;
+                m.add(stringify!($class), ty)?;
+            )*
+            Ok(())
+        }
+    };
+}
+
+engine_errors! {
+    KeyNotFound, "key_not_found", "No node with this key. Carries `.key`.";
+    DuplicateKey, "duplicate_key", "A node with this key already exists. Carries `.key`.";
+    IoError, "io", "The store's filesystem refused a read or a write.";
+    Corrupt, "corrupt", "The store's on-disk state did not parse. Carries `.detail`.";
+    RuleInvalid, "rule_invalid", "The rule definition was rejected. Carries `.detail`.";
+    RuleOwned, "rule_owned", "The edge belongs to a rule and is not writable by hand. Carries `.detail`.";
+    RuleNotFound, "rule_not_found", "No rule by this name. Carries `.name`.";
+    QueryError, "query_error", "The Cypher statement failed. Carries `.detail`, which is also the message.";
+    IngestError, "ingest_error", "The batch was rejected before anything landed. Carries `.detail`.";
+    ReadOnly, "read_only", "This handle never writes: an as-of instance, or one `scoped()` produced.";
+    CommitOutOfRange, "commit_out_of_range", "The commit is outside the retained range `floor..total`. Carries `.commit`, `.total`, `.floor`.";
+    ViewPropReadOnly, "view_prop_read_only", "The property is managed by a view. Carries `.view_name`.";
+    CasConflict, "cas_conflict", "A compare-and-set precondition failed. Carries `.key`, `.expected`, `.actual`.";
+    MaskedReadOnly, "masked_read_only", "A write statement reached a scoped or masked query path, which is read-only.";
+    RoleWriteDenied, "role_write_denied", "A role-bound write was denied. Carries `.reason`, which is also the message.";
+    MushroomBusy, "busy", "Another process holds the store's write lock.\n\nNothing was written, so retrying later is always safe. Raised only by write calls: opening read-only and reading never take the lock. Carries `.holder`, the holding process id when the platform makes it cheaply knowable and `None` otherwise — a diagnostic hint, never something to branch on.";
+    NamespaceImmutable, "namespace_immutable", "A namespace is set at insert and fixed for the node's lifetime. Carries `.key`, `.from_` (spelled with a trailing underscore: `from` is a Python keyword) and `.to`.";
+    CrossNamespace, "cross_namespace", "A hand-written edge would cross a namespace boundary. Carries `.src`, `.src_ns`, `.dst`, `.dst_ns`.";
+}
 
 #[pymodule]
 fn mushroomdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GraphDb>()?;
-    m.add("MushroomBusy", m.py().get_type::<MushroomBusy>())?;
+    register_errors(m)?;
     Ok(())
 }

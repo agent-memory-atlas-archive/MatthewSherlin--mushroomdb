@@ -19,12 +19,168 @@ Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
 Row = dict[str, Any]
 """One result row, keyed by RETURN alias."""
 
-class MushroomBusy(RuntimeError):
+class MushroomError(RuntimeError):
+    """Base class for every error the engine raises.
+
+    It subclasses `RuntimeError`, so every `except RuntimeError` written
+    against an earlier release keeps catching exactly what it caught.
+
+    Each subclass carries `code`, a stable snake_case string equal to the
+    engine's variant name, and the failing variant's own fields as attributes.
+    `code` is the compatibility surface: classes may be added, a code is never
+    respelled. `str(e)` is the message the engine has always produced, so
+    existing logs and substring checks keep working.
+
+    `code` is `None` on this base, which is never raised directly.
+    """
+
+    code: str | None
+
+class KeyNotFound(MushroomError):
+    """No node with this key."""
+
+    code: str
+    key: str
+
+class DuplicateKey(MushroomError):
+    """A node with this key already exists."""
+
+    code: str
+    key: str
+
+class IoError(MushroomError):
+    """The store's filesystem refused a read or a write.
+
+    The engine variant carries an unnamed `std::io::Error`, whose own text is
+    already the message, so this class adds no attribute of its own.
+    """
+
+    code: str
+
+class Corrupt(MushroomError):
+    """The store's on-disk state did not parse."""
+
+    code: str
+    detail: str
+
+class RuleInvalid(MushroomError):
+    """The rule definition was rejected."""
+
+    code: str
+    detail: str
+
+class RuleOwned(MushroomError):
+    """The edge belongs to a rule and is not writable by hand."""
+
+    code: str
+    detail: str
+
+class RuleNotFound(MushroomError):
+    """No rule by this name."""
+
+    code: str
+    name: str
+
+class QueryError(MushroomError):
+    """The Cypher statement failed.
+
+    `detail` is also the message: a Python caller has never seen a prefix.
+    """
+
+    code: str
+    detail: str
+
+class IngestError(MushroomError):
+    """The batch was rejected before anything landed."""
+
+    code: str
+    detail: str
+
+class ReadOnly(MushroomError):
+    """This handle never writes.
+
+    Raised by a write on an as-of instance and by a write on a handle
+    `scoped()` produced.
+    """
+
+    code: str
+
+class CommitOutOfRange(MushroomError):
+    """The commit is outside the retained range `floor..total`.
+
+    `floor` is the oldest commit still reachable — `0` when nothing has been
+    pruned — and `total` is the exclusive upper bound.
+    """
+
+    code: str
+    commit: int
+    total: int
+    floor: int
+
+class ViewPropReadOnly(MushroomError):
+    """The property is managed by a view and cannot be written directly."""
+
+    code: str
+    view_name: str
+
+class CasConflict(MushroomError):
+    """A compare-and-set precondition was not satisfied."""
+
+    code: str
+    key: str
+    expected: int
+    actual: int
+
+class MaskedReadOnly(MushroomError):
+    """A write statement reached a scoped or masked query path, which is read-only."""
+
+    code: str
+
+class RoleWriteDenied(MushroomError):
+    """A role-bound write was denied.
+
+    `reason` is also the message.
+    """
+
+    code: str
+    reason: str
+
+class MushroomBusy(MushroomError):
     """Another process holds the store's write lock.
 
     Nothing was written, so retrying later is always safe. Raised only by write
     calls: opening read-only and reading never take the lock.
+
+    `holder` is the holding process id when the platform makes it cheaply
+    knowable and `None` otherwise — a diagnostic hint, never something to
+    branch on.
     """
+
+    code: str
+    holder: int | None
+
+class NamespaceImmutable(MushroomError):
+    """A namespace is set at insert and fixed for the node's lifetime.
+
+    `from_` carries a trailing underscore because `from` is a Python keyword.
+    """
+
+    code: str
+    key: str
+    from_: str
+    to: str
+
+class CrossNamespace(MushroomError):
+    """A hand-written edge would cross a namespace boundary.
+
+    Only a global rule — one with no `namespace` — may derive one.
+    """
+
+    code: str
+    src: str
+    src_ns: str
+    dst: str
+    dst_ns: str
 
 class GraphDb:
     """An embedded mushroomdb store.

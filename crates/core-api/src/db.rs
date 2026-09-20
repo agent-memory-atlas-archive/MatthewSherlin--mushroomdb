@@ -12922,7 +12922,23 @@ impl<F: Fs> GraphDb<F> {
         self.started_at
     }
 
-    /// On-disk snapshot format version this binary writes and reads.
+    /// The on-disk snapshot version a store that has opted in to nothing
+    /// writes — the **floor**, not the whole answer.
+    ///
+    /// It is not "the version this binary writes", and it is not "the version
+    /// this binary reads". Since v0.6.10 this binary writes 9 **or** 10
+    /// depending on the store — [`snapshot::version_for`] decides, and a store
+    /// that has called [`enable_multiplicity`](Self::enable_multiplicity)
+    /// writes 10 — and it reads 5 through 10. A caller comparing a store's
+    /// stamp against this value must use `>=`, not `==`, or it will report an
+    /// opted-in store as needing a migration *down*; `cli::run_migrate` is the
+    /// worked example.
+    ///
+    /// The name is kept for compatibility: it is public API reachable from the
+    /// CLI and from any embedder, and respelling it would break them for a
+    /// doc-level clarification.
+    ///
+    /// [`snapshot::version_for`]: core_storage::snapshot::version_for
     pub fn format_version() -> u16 {
         core_storage::snapshot::VERSION
     }

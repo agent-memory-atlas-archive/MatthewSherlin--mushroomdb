@@ -64,7 +64,13 @@ pub const VERSION: u16 = VERSION_9;
 /// as-of path and [`crate::v8::MappedBase`] — so the answer cannot drift
 /// between them. A version missing here is read through the full-decode path
 /// instead, which is correct but loads the whole graph onto the heap.
-pub const MMAP_CONTAINER_VERSIONS: [u16; 3] = [VERSION_8, VERSION_9, VERSION_10];
+///
+/// **This list is the only place the set is written down.** [`decode`]'s
+/// container arm is a `match` *guard* calling [`is_mmap_container`] rather than
+/// an arm listing the versions, so adding the next container version is one
+/// edit here and nothing else. A slice, not a fixed-size array, so the length
+/// is not a second thing to keep in step.
+pub const MMAP_CONTAINER_VERSIONS: &[u16] = &[VERSION_8, VERSION_9, VERSION_10];
 
 /// Whether `version` is one of the [`MMAP_CONTAINER_VERSIONS`].
 pub fn is_mmap_container(version: u16) -> bool {
@@ -344,11 +350,20 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
         VERSION_5 => decode_v5(&bytes[6..]),
         VERSION_6 => decode_v6(&bytes[6..]),
         VERSION_7 => decode_v7(&bytes[6..]),
-        // V8, V9 and V10 are the same file-based container; `decode_v8_from_mapped`
-        // reads the shared string section when the directory carries one. V10
-        // adds no section and no field — it only declares that the store's WAL
-        // may carry discriminant 23.
-        VERSION_8 | VERSION_9 | VERSION_10 => {
+        // The mmap-able container family shares one decode path;
+        // `decode_v8_from_mapped` reads the shared string section when the
+        // directory carries one. V9 added section 12 and V10 added nothing at
+        // all — it only declares that the store's WAL may carry discriminant
+        // 23.
+        //
+        // A guard, not an arm listing the versions: a `match` guard *can* call
+        // a function, and `MMAP_CONTAINER_VERSIONS` is then the single place
+        // the set is written down. Listing them here again is how a version
+        // gets added to the encoder and to the header parser but not to the
+        // decoder, producing a store this binary writes and then refuses to
+        // open. `every_version_the_encoder_writes_is_mmap_able` could not have
+        // caught that: it never reaches this function.
+        v if is_mmap_container(v) => {
             let mapped = crate::v8::MappedBase::from_bytes(bytes.to_vec())?;
             decode_v8_from_mapped(&mapped)
         }
@@ -718,6 +733,49 @@ mod tests {
         }
         assert!(!is_mmap_container(VERSION_7));
         assert!(!is_mmap_container(VERSION_10 + 1));
+    }
+
+    /// `decode`'s dispatch must agree with `MMAP_CONTAINER_VERSIONS` — over
+    /// versions that do not exist yet, which is where the drift would be.
+    ///
+    /// The test above compares two constants in this file that would be edited
+    /// in the same breath; it never calls `decode`. This one does, on real
+    /// restamped container bytes, and that is the copy of the list that would
+    /// actually be forgotten: before `decode`'s arm became a guard it spelled
+    /// the three versions out, so a V11 added to `version_for` and to
+    /// `MMAP_CONTAINER_VERSIONS` and nowhere else produced a store this binary
+    /// writes and then refuses to open, with every test in this file green.
+    ///
+    /// Green before the guard landed as well as after — the arm listed exactly
+    /// the three versions the list holds, so today the two agree either way.
+    /// What it buys is the *next* version: it fails the moment the list gains a
+    /// member `decode` will not take, which under the guard cannot happen and
+    /// without it was one forgotten edit away.
+    #[test]
+    fn decode_dispatch_matches_the_container_list() {
+        let state = tiny_state();
+        let v9 = encode(&state).unwrap();
+
+        // Sweep past the versions that exist: 11..=16 are the ones a later
+        // release will claim, and they must track the list, not a literal.
+        for v in 0u16..=16 {
+            let mut buf = v9.clone();
+            // V5-V7 are a different container shape entirely; restamping V9's
+            // bytes to one of them asks `decode` to read them as that format,
+            // which is exactly the "not a container" answer under test.
+            if stamp_container_version(&mut buf, v).is_err() {
+                continue;
+            }
+            let decoded_ok = decode(&buf).map(|s| s.is_some()).unwrap_or(false);
+            assert_eq!(
+                decoded_ok,
+                is_mmap_container(v),
+                "V{v}: is_mmap_container says {}, but decode {} it — \
+                 decode's dispatch and MMAP_CONTAINER_VERSIONS have drifted",
+                is_mmap_container(v),
+                if decoded_ok { "accepted" } else { "refused" }
+            );
+        }
     }
 
     /// A buffer that is not a container is refused rather than corrupted.

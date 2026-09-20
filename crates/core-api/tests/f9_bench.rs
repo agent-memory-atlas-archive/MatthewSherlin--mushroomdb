@@ -1,4 +1,20 @@
-//! TEMPORARY — F9 measurement harness. Not committed.
+//! The measurement behind defect #29 (review finding F9), kept so the number
+//! can be reproduced rather than taken on trust.
+//!
+//! `#[ignore]`, and that is the point: it builds 20 000 nodes and 160 000 edge
+//! inserts and takes about thirteen minutes, it asserts nothing about timing,
+//! and a test that cannot fail has no business in `cargo test --workspace`.
+//! Run it deliberately:
+//!
+//! ```text
+//! cargo test -p mushroomdb --release --test f9_bench -- --ignored --nocapture
+//! F9_N=50000 cargo test -p mushroomdb --release --test f9_bench -- --ignored --nocapture
+//! ```
+//!
+//! What it showed, release profile, n=20 000, fanout 4, every pair inserted
+//! twice, snapshotted and reopened so the mmap'd-base branch is the one taken,
+//! 5 reps, median — see `docs/roadmap/v0.6.10-defects.md` #29 for the numbers
+//! and what changed between them.
 use core_api::algo::AlgoDir;
 use core_api::GraphDb;
 use core_storage::fs::RealFs;
@@ -30,6 +46,7 @@ fn build(dir: &std::path::Path, n: usize, fanout: usize) -> Db {
 }
 
 #[test]
+#[ignore = "a ~13-minute benchmark that asserts nothing; run it with --ignored"]
 fn f9_measure() {
     let n: usize = std::env::var("F9_N")
         .ok()

@@ -1534,7 +1534,24 @@ impl GraphDb {
     /// missing = configured_roles - known        # fail the boot, not the request
     /// ```
     ///
-    /// Refused on a scoped handle — see the note on `scoped()`.
+    /// Refused on a scoped handle — see the note on `scoped()` — and the
+    /// refusal is a plain **`ValueError`**, not a `MushroomError`.
+    ///
+    /// That is deliberate, and it is the one refusal in this binding that is
+    /// not a typed engine error, so it is worth saying why. `ReadOnly` — the
+    /// `MushroomError` subclass the other scoped refusals raise — means *a
+    /// scoped handle never writes*: `refuse_if_scoped` is reached only from
+    /// the write path. `roles()` is a read, and the only read refused
+    /// outright, so it has no `ReadOnly` precedent to follow; raising one here
+    /// would make that class mean two different things. Calling `roles()` on a
+    /// scoped handle is caller misuse with no engine condition behind it — the
+    /// same kind of thing as `scoped()`'s empty-scope refusal, which is a
+    /// `ValueError` too.
+    ///
+    /// The cost is real and is the reason this is documented rather than
+    /// merely true: a sidecar that wraps its boot-time role check in
+    /// `except mushroomdb.MushroomError` will **not** catch this one. Catch
+    /// `ValueError` as well, or call `roles()` before narrowing the handle.
     #[pyo3(text_signature = "($self)")]
     fn roles(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         // The one schema surface made of node data. A role definition names the

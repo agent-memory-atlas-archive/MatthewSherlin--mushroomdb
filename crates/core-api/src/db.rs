@@ -11187,7 +11187,15 @@ impl<F: Fs> GraphDb<F> {
             .ids
             .get(key)
             .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
-        Ok(self.multiplicity_directed_degree(id, edge_type, direction, None))
+        Ok(Self::multiplicity_directed_degree(
+            &self.topo_view(),
+            &self.edge_props_view(),
+            &self.syms,
+            id,
+            edge_type,
+            direction,
+            None,
+        ))
     }
 
     /// [`degree_multiplicity`](Self::degree_multiplicity) under a scope.
@@ -11211,7 +11219,15 @@ impl<F: Fs> GraphDb<F> {
             .get(key)
             .filter(|&id| mask.contains_id(id))
             .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
-        Ok(self.multiplicity_directed_degree(id, edge_type, direction, Some(mask)))
+        Ok(Self::multiplicity_directed_degree(
+            &self.topo_view(),
+            &self.edge_props_view(),
+            &self.syms,
+            id,
+            edge_type,
+            direction,
+            Some(mask),
+        ))
     }
 
     /// [`degree`](Self::degree) counting **only neighbours the mask admits**.
@@ -11397,7 +11413,18 @@ impl<F: Fs> GraphDb<F> {
             .filter_map(|id| {
                 let key = self.ids.key_of(id)?.to_string();
                 let deg = match (multiplicity, mask) {
-                    (true, m) => self.multiplicity_directed_degree(id, edge_type, direction, m),
+                    // The same `view` the unique arms read, so the per-row
+                    // rebuild F9 measured is gone and all three arms agree on
+                    // the state they are reading.
+                    (true, m) => Self::multiplicity_directed_degree(
+                        &view.topo,
+                        &view.edge_props,
+                        view.syms,
+                        id,
+                        edge_type,
+                        direction,
+                        m,
+                    ),
                     (false, Some(m)) => Self::visible_directed_degree(
                         &view.topo, view.syms, id, edge_type, direction, m,
                     ),
@@ -11493,11 +11520,22 @@ impl<F: Fs> GraphDb<F> {
     /// direction decides which way round the pair is addressed: an `In`
     /// neighbour `n` of `id` is the pair `(et, n, id)`.
     ///
-    /// Takes `&self` rather than the view parameters the unique helpers take
-    /// because the counts live in the edge-property view, which is built from
-    /// the overlay and the mmap'd base together.
+    /// Takes its views as parameters, exactly as the unique helpers do, because
+    /// it is called once per row from a label scan. `edge_props_view()` reaches
+    /// into the mmap'd base's rkyv section on every call, so building the two
+    /// views inside made an N-row `degrees(multiplicity=True)` do N section
+    /// accesses where the unique reading does one: worth 2.57 ms of 16.68 ms
+    /// over 20 000 rows, about 0.13 us per row (defect #29,
+    /// `tests/f9_bench.rs`). Most of that call's cost is the per-neighbour
+    /// count lookup and is inherent, so this is a hoist, not a rescue.
+    ///
+    /// The views are exactly `self.view()`'s own `topo` and `edge_props`, so a
+    /// caller that already has a view passes its halves and reads the same
+    /// state it reads everything else from.
     fn multiplicity_directed_degree(
-        &self,
+        topo: &TopologyView<'_>,
+        edge_props: &EdgePropsView<'_>,
+        syms: &Interner,
         id: u32,
         edge_type: Option<&str>,
         direction: crate::algo::AlgoDir,
@@ -11508,8 +11546,6 @@ impl<F: Fs> GraphDb<F> {
             crate::algo::AlgoDir::In => &[Direction::In],
             crate::algo::AlgoDir::Both => &[Direction::Out, Direction::In],
         };
-        let topo = self.topo_view();
-        let edge_props = self.edge_props_view();
         let count_of = |et: u32, src: u32, dst: u32| -> u64 {
             match edge_props.get(et, src, dst, EDGE_COUNT_PROP) {
                 Some(Value::Int(n)) if n > 0 => n as u64,
@@ -11531,7 +11567,7 @@ impl<F: Fs> GraphDb<F> {
                 .sum()
         };
         match edge_type {
-            Some(name) => self.syms.get(name).map_or(0, per_etype),
+            Some(name) => syms.get(name).map_or(0, per_etype),
             None => topo.etypes().map(per_etype).sum(),
         }
     }

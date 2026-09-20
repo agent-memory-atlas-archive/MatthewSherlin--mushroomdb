@@ -764,6 +764,14 @@ class GraphDb:
         poisoned sidecar must not read as "nothing is restricted here". Refused
         on a `scoped()` handle: a role definition names node keys, namespaces
         and the other roles in the store.
+
+        That refusal is a plain **`ValueError`**, not a `MushroomError` — the
+        one refusal here that is not a typed engine error. `ReadOnly` means *a
+        scoped handle never writes*, and `roles()` is a read; calling it on a
+        scoped handle is caller misuse, the same kind of thing as `scoped()`'s
+        empty-scope `ValueError`. So a sidecar wrapping its boot-time role
+        check in `except MushroomError` will not catch this one: catch
+        `ValueError` too, or call `roles()` before narrowing the handle.
         """
 
     def snapshot(self) -> None:

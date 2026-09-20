@@ -763,3 +763,134 @@ fn a_reader_snapshot_carries_the_count() {
         "the reader's edge-property overlay must carry the count"
     );
 }
+
+// ── the reserved name `count` against a rule that claims it (F10) ────────────
+
+/// `EDGE_COUNT_PROP` and a rule's `weight_prop` are stored in the same
+/// `edge_props` map, keyed the same way, so a rule declaring `weight_prop:
+/// "count"` names the slot the insert count lives in. Nothing refuses such a
+/// rule, and `enable_multiplicity` does no pre-flight scan for one — deliberately,
+/// because three independent properties keep the two apart. This test is what
+/// says so; remove any one of them and it goes red.
+///
+/// 1. A rule-owned edge cannot be inserted by hand: `insert_edge` answers
+///    [`GraphError::RuleOwned`], so a duplicate insert can never reach
+///    `edge_count_record` for a pair whose weight the rule wrote.
+/// 2. The engine writes a weight only onto an edge the rule *owns* — never onto
+///    a pre-existing user edge — so the reverse order cannot collide either.
+/// 3. A weight is always `Value::Float`; the count readers take only
+///    `Value::Int`, so even a Float in the slot reads as the absent-means-one
+///    default rather than as a count.
+///
+/// If a later release relaxes (1) or (2), this test is the one that notices.
+/// It does **not** kill a mutant that widened the count readers to accept a
+/// Float — barrier 3 only matters once 1 and 2 have fallen, and the score a
+/// `FieldEqual` rule writes is `1.0`, which a Float-accepting reader and the
+/// absent-means-one default would both report as 1. Barrier 3 is stated here
+/// because it is load-bearing, and pinned only as far as the fixture reaches.
+#[test]
+fn a_rule_claiming_the_reserved_count_name_cannot_collide_with_it() {
+    fn same_rule() -> core_api::RuleDef {
+        core_api::RuleDef {
+            name: "same".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: core_api::Predicate::FieldEqual {
+                field: "industry".into(),
+            },
+            edge_type: "SAME".into(),
+            // The reserved name, claimed by a rule. Accepted: see above.
+            weight_prop: Some("count".into()),
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        }
+    }
+    fn seed(name: &str) -> (std::path::PathBuf, Db) {
+        let dir = tmp(name);
+        let mut db = GraphDb::open(&dir).unwrap();
+        for (label, key) in [("Org", "o1"), ("Person", "p1")] {
+            db.insert_node(
+                label,
+                key,
+                vec![("industry".into(), Value::Str("x".into()))],
+            )
+            .unwrap();
+        }
+        (dir, db)
+    }
+    let weight = |db: &Db| -> Option<Value> {
+        db.query(
+            "MATCH (p:Person)-[r:SAME]->(o:Org) RETURN r.count",
+            &Default::default(),
+        )
+        .unwrap()
+        .get(0, "r.count")
+        .cloned()
+    };
+
+    // Rule first: the rule owns the edge and writes its weight into `count`.
+    let (_a, mut db) = seed("rule-claims-count-a");
+    db.create_rule(same_rule())
+        .expect("a rule may name the reserved prop; nothing refuses it");
+    assert_eq!(
+        weight(&db),
+        Some(Value::Float(1.0)),
+        "fixture: the rule's weight is in the `count` slot, as a Float"
+    );
+    db.enable_multiplicity()
+        .expect("opting in does not pre-flight the rule set, and does not need to");
+    for _ in 0..2 {
+        assert!(
+            matches!(
+                db.insert_edge("SAME", "p1", "o1"),
+                Err(GraphError::RuleOwned { .. })
+            ),
+            "barrier 1: a rule-owned edge is not insertable, so no count is ever \
+             written over the rule's weight"
+        );
+    }
+    assert_eq!(
+        weight(&db),
+        Some(Value::Float(1.0)),
+        "the rule's weight survives the attempted duplicates"
+    );
+    assert_eq!(
+        db.degree_multiplicity("p1", Some("SAME"), AlgoDir::Out)
+            .unwrap(),
+        1,
+        "the pair contributes the absent-means-one default; no count was ever \
+         written for it"
+    );
+
+    // User edge first: the rule is created over a pair the user already owns.
+    let (_b, mut db) = seed("rule-claims-count-b");
+    db.enable_multiplicity().unwrap();
+    assert!(db.insert_edge("SAME", "p1", "o1").unwrap());
+    assert!(!db.insert_edge("SAME", "p1", "o1").unwrap());
+    assert_eq!(weight(&db), Some(Value::Int(2)), "fixture: a real count");
+    db.create_rule(same_rule()).unwrap();
+    assert_eq!(
+        weight(&db),
+        Some(Value::Int(2)),
+        "barrier 2: the rule does not own the user's edge, so it writes no \
+         weight over the count"
+    );
+    assert_eq!(
+        db.explain("p1", "o1")
+            .unwrap()
+            .first()
+            .and_then(|e| e.weight),
+        None,
+        "and it reports no stored weight for the pair, rather than the count"
+    );
+    assert!(!db.insert_edge("SAME", "p1", "o1").unwrap());
+    assert_eq!(
+        weight(&db),
+        Some(Value::Int(3)),
+        "the count keeps counting: the rule never took the slot"
+    );
+}

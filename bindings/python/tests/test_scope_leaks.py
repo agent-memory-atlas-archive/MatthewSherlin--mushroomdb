@@ -372,6 +372,54 @@ def test_roles_is_refused_on_a_scoped_handle(store):
     assert "scoped" in str(err.value)
 
 
+def test_the_roles_refusal_is_a_plain_value_error_and_both_docs_say_so(store):
+    """Defect F7. `roles()` is the one refusal here that is not a typed engine
+    error, and until now neither doc named the class.
+
+    The choice is deliberate. `ReadOnly` — what every other scoped refusal
+    raises — means *a scoped handle never writes*; it is raised only from
+    `refuse_if_scoped`, which only the write path reaches. `roles()` is a read,
+    and the only read refused outright, so it has no `ReadOnly` precedent to be
+    inconsistent with, and raising one would make that class mean two things.
+
+    The cost is real: a sidecar catching `MushroomError` around a boot-time
+    role check does not catch this. So the class is pinned here, and both the
+    docstring and the packaged stub must say it — this is defect #18's shape,
+    where the behaviour was right and the sentence describing it was absent.
+    """
+    import importlib.util
+    import pathlib
+
+    import mushroomdb
+
+    _db, s = store
+    with pytest.raises(ValueError) as err:
+        s.roles()
+    assert type(err.value) is ValueError, (
+        f"the roles refusal is {type(err.value).__name__}; it is documented as a "
+        "plain ValueError, so changing it is a breaking change to a documented class"
+    )
+    assert not isinstance(err.value, mushroomdb.MushroomError), (
+        "deliberately outside the MushroomError tree: it is caller misuse, not an "
+        "engine condition"
+    )
+
+    spec = importlib.util.find_spec("mushroomdb")
+    assert spec is not None and spec.origin is not None
+    stub = (pathlib.Path(spec.origin).parent / "__init__.pyi").read_text()
+    stub_doc = stub.split("def roles(", 1)[1].split("\n    def ", 1)[0]
+    doc = GraphDb.roles.__doc__ or ""
+    for text, where in ((doc, "roles docstring"), (stub_doc, "packaged __init__.pyi")):
+        assert "ValueError" in text, (
+            f"{where} does not name the class the scoped refusal raises, so a caller "
+            "cannot know it is outside the MushroomError tree"
+        )
+        assert "MushroomError" in text, (
+            f"{where} names ValueError without saying it is *not* a MushroomError, "
+            "which is the half a sidecar's except clause needs"
+        )
+
+
 def test_restore_is_a_staticmethod_about_other_directories(tmp_path):
     """`restore` is a staticmethod: `s.restore(a, b)` is `GraphDb.restore(a, b)`.
 
@@ -488,33 +536,56 @@ def test_upsert_node_is_not_an_existence_or_label_oracle(store):
 # Every write, called once against a hidden key and once against an absent one.
 # The two calls must be indistinguishable: same class, same message. A write
 # that reads the store before refusing shows up here as a difference.
+#
+# Defect #16: the key is **every** key argument the method takes, not one of
+# them. The rows are a cross-product of `(method, key position)`, so a write
+# with two endpoints is probed on both. There is no live gap today — all five
+# two-key writes refuse at `with_mut` before either argument is read — but the
+# property this dict exists to enforce is *no key argument is read before the
+# refusal*, and probing one position per method tested that for one argument.
+# `upsert_node` (defect #8) is what an endpoint pre-check looks like when it
+# slips in; a `src`-side one would have passed the old parametrisation.
 _WRITES_BY_KEY = {
-    "insert_node": lambda s, k: s.insert_node("Person", k, {"t": 1}),
+    ("insert_node", "key"): lambda s, k: s.insert_node("Person", k, {"t": 1}),
     # A *mismatching* label on purpose: `test_scoped.py` probes with the stored
     # label, which falls straight through to the write refusal and never runs
     # the branch defect #8 lived in.
-    "upsert_node": lambda s, k: s.upsert_node("__probe_label__", k, {"t": 1}),
-    "insert_edge": lambda s, k: s.insert_edge("LINKS", "vis_a", k),
-    "delete_edge": lambda s, k: s.delete_edge("LINKS", "vis_a", k),
-    "insert_edge_upsert": lambda s, k: s.insert_edge_upsert("LINKS", "vis_a", k, "Person"),
-    "delete_node": lambda s, k: s.delete_node(k),
-    "set_prop": lambda s, k: s.set_prop(k, "t", 1),
-    "remove_prop": lambda s, k: s.remove_prop(k, "t"),
-    "rename_node": lambda s, k: s.rename_node(k, "__probe__"),
-    "query_write": lambda s, k: s.query_write(
+    ("upsert_node", "key"): lambda s, k: s.upsert_node("__probe_label__", k, {"t": 1}),
+    ("insert_edge", "src"): lambda s, k: s.insert_edge("LINKS", k, "vis_b"),
+    ("insert_edge", "dst"): lambda s, k: s.insert_edge("LINKS", "vis_a", k),
+    ("delete_edge", "src"): lambda s, k: s.delete_edge("LINKS", k, "vis_b"),
+    ("delete_edge", "dst"): lambda s, k: s.delete_edge("LINKS", "vis_a", k),
+    ("insert_edge_upsert", "src"): lambda s, k: s.insert_edge_upsert(
+        "LINKS", k, "vis_b", "Person"
+    ),
+    ("insert_edge_upsert", "dst"): lambda s, k: s.insert_edge_upsert(
+        "LINKS", "vis_a", k, "Person"
+    ),
+    ("delete_node", "key"): lambda s, k: s.delete_node(k),
+    ("set_prop", "key"): lambda s, k: s.set_prop(k, "t", 1),
+    ("remove_prop", "key"): lambda s, k: s.remove_prop(k, "t"),
+    ("rename_node", "old"): lambda s, k: s.rename_node(k, "__probe__"),
+    ("rename_node", "new"): lambda s, k: s.rename_node("vis_a", k),
+    ("query_write", "key"): lambda s, k: s.query_write(
         "MATCH (n) WHERE key(n) = $k SET n.t = 1 RETURN key(n)", {"k": k}
     ),
-    "ingest_batch": lambda s, k: s.ingest_batch(
+    ("ingest_batch", "key"): lambda s, k: s.ingest_batch(
         [{"key": k, "label": "Person", "props": {"t": 1}}], on_conflict="replace"
     ),
-    "batch_edges": lambda s, k: s.batch_edges([{"edge_type": "LINKS", "src": "vis_a", "dst": k}]),
+    ("batch_edges", "src"): lambda s, k: s.batch_edges(
+        [{"edge_type": "LINKS", "src": k, "dst": "vis_b"}]
+    ),
+    ("batch_edges", "dst"): lambda s, k: s.batch_edges(
+        [{"edge_type": "LINKS", "src": "vis_a", "dst": k}]
+    ),
 }
 
 
-@pytest.mark.parametrize("name", sorted(_WRITES_BY_KEY))
-def test_a_keyed_write_refuses_identically_for_hidden_and_absent(store, name):
+@pytest.mark.parametrize("name,position", sorted(_WRITES_BY_KEY))
+def test_a_keyed_write_refuses_identically_for_hidden_and_absent(store, name, position):
     db, s = store
-    call = _WRITES_BY_KEY[name]
+    call = _WRITES_BY_KEY[(name, position)]
+    who = f"{name}({position})"
 
     with pytest.raises(RuntimeError) as hidden:
         call(s, "hidden_x")
@@ -522,17 +593,21 @@ def test_a_keyed_write_refuses_identically_for_hidden_and_absent(store, name):
         call(s, ABSENT)
 
     assert type(hidden.value) is type(absent.value), (
-        f"{name}: hidden → {type(hidden.value).__name__}, "
+        f"{who}: hidden → {type(hidden.value).__name__}, "
         f"absent → {type(absent.value).__name__}; the class is an existence oracle"
     )
-    assert str(hidden.value) == str(absent.value), f"{name} discloses: {hidden.value}"
-    _assert_clean(f"{name} refusal", str(hidden.value))
-    assert "scoped" in str(hidden.value), f"{name}: {hidden.value}"
+    assert str(hidden.value) == str(absent.value), f"{who} discloses: {hidden.value}"
+    _assert_clean(f"{who} refusal", str(hidden.value))
+    assert "scoped" in str(hidden.value), f"{who}: {hidden.value}"
 
     # And nothing landed, on either key.
     assert db.node_info("hidden_x")["props"].get("t") is None
     assert db.node_info(ABSENT) is None
     assert db.node_info("__probe__") is None
+    # The `rename_node(new)` row moves `vis_a`, not the probed key, so the
+    # subject of every two-key row has to be checked too — otherwise that row
+    # asserts nothing about what the refusal prevented.
+    assert db.node_info("vis_a") is not None, f"{who}: the write's other endpoint moved"
 
 
 # Writes with no node key to probe. They still must refuse, and refuse before

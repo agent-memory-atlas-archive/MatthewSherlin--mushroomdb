@@ -148,8 +148,12 @@ limits**.
   and stays a `HashSet` otherwise — read as memory rather than density, the
   bitset is chosen precisely when it is no larger than the set it replaces, so a
   role seeing ten nodes at the top of a ten-million-id store stays sparse by four
-  orders of magnitude. The rule is evaluated once at construction, from the
-  distinct count, and fixed for the set's life. This release puts `contains_id`
+  orders of magnitude. The representation is decided at construction and fixed
+  for the set's life — no later call re-shapes a set, and `intersect` returns a
+  new one. The rule's *outcome* is the distinct count's: the first evaluation
+  uses a count that still includes duplicates, which can only rule a bitset out,
+  and when it passes, the bitset does the deduplication and the rule is re-checked
+  on the population that comes out of it. This release puts `contains_id`
   in the inner loop of nine more surfaces, which is what made it worth measuring;
   `crates/core-api/tests/mask_bench.rs` is the committed measurement, over a
   200,000-node store, release profile, five processes of 51 repetitions each:
@@ -176,9 +180,15 @@ limits**.
   widened the predicate from a bare `is_ascii_control()` to the full
   bidi/zero-width class and paid for it on a hot path: every character of every
   digest string fell through six `matches!` arms a plain byte can never hit. Over
-  ~400 KB of representative digest text the 0.6.9 form ran 40% slower than the
-  0.6.8 predicate it replaced — 588 µs against 420. The fast path brings it to
-  309 µs, 27% faster than 0.6.8, for identical output on every input.
+  ~400 KB of representative digest text, median of five runs of
+  `crates/core-api/examples/sanitize_bench.rs`, the committed harness: the 0.6.9
+  form ran about 27% slower than the 0.6.8 predicate it replaced — 775 µs against
+  612. The fast path brings it to 585 µs, which **returns the cost to 0.6.8's**;
+  the remainder is inside the run-to-run spread and is not claimed as a gain.
+  Output is identical on every input — the harness asserts that over all 1.1M code
+  points before it times anything. Absolute microseconds are machine-specific;
+  re-run it rather than trusting these, and expect the ordering to hold while the
+  magnitudes move.
 - **The `.pyi` stub says what the Rust doc comments say, and a check keeps it
   that way.** Forty-two of the stub's docstrings were one-liners while the
   compiled `__doc__` documented the contract — an IDE hover and a type-checker

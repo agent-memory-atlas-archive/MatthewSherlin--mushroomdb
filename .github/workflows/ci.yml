@@ -342,19 +342,38 @@ jobs:
       # `gh` is installed on the runner but is not authenticated, so the script
       # drops `--prs` by itself and says so in its output.
       #
-      # The budgets here are 3x the local ones (200 ms / 1000 ms). A hosted
-      # runner is too noisy to enforce a latency gate at the product's own
-      # numbers — this repository already keeps its throughput and p95 gates
-      # out of CI for that reason — but 3x still catches a gross regression.
-      # The product numbers are what scripts/bench-code-graph.sh measures.
+      # What these four numbers actually measure, measured rather than assumed:
+      # each is a whole process, and on a ~520-file graph `--version` takes 3 ms
+      # while `stats` — which opens the store and does almost nothing else —
+      # takes 371 ms. `map` is 376 and `brief` 401. So ~95% of every reading
+      # here is store open, the per-command work is 0-30 ms on top, and the four
+      # budgets are four thresholds on one shared quantity, not on the commands
+      # they name.
+      #
+      # That quantity tracks runner speed, not this repository. Across
+      # 2026-09-11..09-21 the touch median on green runs read 359, 360, 487,
+      # 557, 588, 398 ms — a ~1.8x spread with the code unchanged underneath it,
+      # and 588 already sat at 98% of the 600 ms the old budget allowed. The
+      # previous comment here justified these as "3x the local budgets", which
+      # the runner has since outgrown: it now lands at 600-650 ms routinely, so
+      # the gate had begun failing on runner load. 0.6.10 is what happened to be
+      # in flight when it finally crossed; it is not what moved the number.
+      #
+      # 1400 ms is ~2x the worst reading observed on unchanged code, which keeps
+      # a gross regression — a doubling of store-open cost — inside the gate
+      # while leaving the noise outside it. `map` keeps its larger budget
+      # because it is the one leg that also grows with graph size. A gate that
+      # could see a 200 ms regression is not reachable on a hosted runner; the
+      # product's real numbers are what scripts/bench-code-graph.sh measures,
+      # and this repository already keeps its throughput and p95 gates out of CI
+      # for the same reason.
       - name: acceptance-0.6
         run: MUSHROOMDB=target/release/mushroomdb bash scripts/acceptance-0.6.sh
         env:
-          TOUCH_BUDGET_MS: "600"
+          TOUCH_BUDGET_MS: "1400"
           MAP_BUDGET_MS: "3000"
-          # Same reasoning as above: ~2.5-3x the local budgets (300 ms / 400 ms).
-          BRIEF_BUDGET_MS: "800"
-          EXPLORE_BUDGET_MS: "1000"
+          BRIEF_BUDGET_MS: "1400"
+          EXPLORE_BUDGET_MS: "1400"
 
   plugin-validate:
     runs-on: ubuntu-latest

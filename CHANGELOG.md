@@ -1,5 +1,298 @@
 # Changelog
 
+## v0.6.10 — scoped reads and stable errors
+
+A scope stops being an argument you have to remember on every call and becomes a
+property of the handle. `db.scoped(role=…, namespace=…, keys=[…])` returns a
+read-only child sharing the same store, and every read on it obeys one rule:
+**hidden behaves exactly as absent.** The role-read contract that until now lived
+only in the HTTP server lives in the engine, once, and HTTP calls it. Alongside
+that: every engine failure is a stable Python class that still subclasses
+`RuntimeError`, a mirror can be rebuilt onto a store that already has content,
+and insert-count multiplicity is available to the stores that ask for it. Nothing
+an existing caller does changes behaviour, and stores stay V9 and upgrade in
+place — unless you call `enable_multiplicity()`, which is the one opt-in step
+with a one-way consequence, described under **Added** and again under **Known
+limits**.
+
+#### Added
+
+- **`db.scoped(role=…, namespace=…, keys=[…])` — a scope is a property of the
+  handle.** It returns a `GraphDb`-shaped child sharing this handle's store and
+  mutex: not a second open, no second lock, one small allocation, and `close()`
+  on either name closes both. At least one leg is required (none raises
+  `ValueError`); legs intersect, so `scoped()` on a scoped handle narrows further
+  and never widens, and `keys=[]` narrows to nothing. An unknown role raises at
+  `scoped()`, not on the first read. Every mutation raises `ReadOnly` —
+  `snapshot`, `create_rule`, `enable_index` and `ingest_batch` included —
+  while `refresh()` is permitted because it writes nothing.
+- **Every read on a scoped handle applies the scope, under one contract.** The
+  subject is checked first, so *a key outside the scope is indistinguishable from
+  a key that does not exist*; then every other node the answer would mention —
+  neighbour, endpoint, candidate, evidence — is filtered to the scope. Which
+  answer "absent" is stays a per-method fact, so each surface answers what it
+  already answers for an unknown key: `node_info` → `None`; `node_edges`,
+  `neighbors`, `explain`, `degree`, `what_if_set_prop` → `KeyNotFound`;
+  `node_history`, `edge_history`, `edges_at` → empty; `was_linked` → `False`;
+  `get_edge_prop` → `None`. Raising for a hidden subject on a surface that
+  returns empty for an absent one would be the existence oracle the contract
+  exists to prevent. `stats` keeps store-wide counts and narrows only its
+  namespace roster; `has_vector_rule` and `is_index_enabled` answer unscoped,
+  being schema rather than node data.
+- **The scope resolves per read, not once at `scoped()`.** A resolved allow-list
+  is cached against the store's commit sequence, so a repeated read costs an
+  integer compare while a read after a write rebuilds. A handle held across a
+  write can never serve a stale allow-list, which would be a leak rather than a
+  staleness bug, and a 50,000-key `keys=` leg does not pay 50,000 lookups per
+  read.
+- **`degree` counts only visible neighbours, and `pairwise_similar` drops hidden
+  keys before the matmul.** A count is arithmetic that discloses, so an
+  unfiltered one leaks the hidden neighbours the edge filter exists to hide; and
+  a hidden vector that reaches the Gram influences a score even when it never
+  appears as a result. `search_hybrid` filters both legs **before** RRF fusion,
+  so the ranks are the ranks of the visible corpus and `k` is honoured.
+  `explain` omits an explanation whose evidence path crosses a hidden node
+  entirely rather than redacting it.
+- **Masked engine entry points for the four surfaces that had none** —
+  `pairwise_similar`, `search_hybrid`, `explain`, `degree`/`degrees` — plus
+  `_scoped` wrappers that add the subject check, each with a `ReaderSnapshot`
+  twin so the HTTP role paths keep reading one coherent lock-free epoch.
+  `pairwise_similar` measures its size caps (Gram ≤ 4,096, gemv ≤ 8,192 unique
+  keys) on the **post-filter** count, so a scope can bring an over-cap call under
+  it. `node_edges_masked` keeps its looser, documented subject contract for the
+  full-token path; the new wrapper is what tightens it for role-scoped callers.
+- **A stable exception class per engine error.** `MushroomError(RuntimeError)`
+  is the base and eighteen subclasses hang off it — `KeyNotFound`,
+  `DuplicateKey`, `IoError`, `Corrupt`, `RuleInvalid`, `RuleOwned`,
+  `RuleNotFound`, `QueryError`, `IngestError`, `ReadOnly`, `CommitOutOfRange`,
+  `ViewPropReadOnly`, `CasConflict`, `MaskedReadOnly`, `RoleWriteDenied`,
+  `MushroomBusy`, `NamespaceImmutable`, `CrossNamespace`. Each carries `.code`, a
+  stable snake_case string that reads the same off the class and off a caught
+  instance, and the variant's own fields as attributes (`e.key`, `e.floor`,
+  `e.view_name`, `e.from_`). **`.code` is the compatibility surface**: classes may
+  be added, a code is never respelled. `str(e)` is the message the engine has
+  always produced, so existing logs and substring checks are unaffected, and
+  because the base subclasses `RuntimeError` every `except RuntimeError` written
+  against an earlier release keeps catching exactly what it caught.
+  `MushroomBusy` is reparented onto `MushroomError` and stays a `RuntimeError`.
+  A test asserts every `GraphError` variant maps to a distinct class, so adding a
+  variant in Rust without adding a class fails the build.
+- **`ingest_batch(nodes, edges, on_conflict="error" | "skip" | "replace")`.** A
+  mirror rebuilds onto a store that already has content without wiping the
+  directory and without one duplicate key rejecting a 100,000-row frame.
+  `"error"` is the default and is the previous behaviour exactly. `"skip"` leaves
+  the stored node untouched. `"replace"` makes its properties exactly the supplied
+  props — fields absent from them are removed — while a label that differs from
+  the stored one and an `ns` that would move the node are **row errors**, not
+  silent rewrites. Two properties sit outside "exactly" because neither is the
+  caller's to supply: `ns`, which is immutable, and any property a view owns,
+  which is kept rather than removed and counted in `kept_view_owned`. The frame
+  stays atomic — only the definition of "valid" changes — and the report gains
+  `skipped`, `replaced` and `kept_view_owned` beside `inserted` and
+  `edges_inserted`.
+- **`db.roles()`** returns what `roles.json` defines (`name`, `labels`, `keys`,
+  `namespaces`, `visible_where`), so a sidecar can validate a role name at boot
+  instead of discovering it on the first request. `[]` when no roles are defined,
+  and it **raises `Corrupt`** when `roles.json` was corrupt at open, because an
+  unrestricted store answers `[]` too and a poisoned one must not read as
+  "nothing is restricted here".
+- **`GraphDb.restore(src, dst)`** in Python, wrapping the CLI's semantics: a
+  backup directory or a directory of them, `latest` winning outright and
+  otherwise the newest by mtime, staged inside `dst` and opened there before
+  anything is moved into place. A non-empty `dst` is **refused, not merged**. It
+  returns `{outcome, from, files, bytes}`. `restore_plus_refresh_answers_identically`
+  pins the round trip: `query`, exact `find_similar`, `degree`, `stats` and
+  `node_history` agree row for row with the source store.
+- **Opt-in insert-count multiplicity.** `enable_multiplicity()` starts recording
+  a per-pair insert count on a store; `is_multiplicity_enabled()` reads it back;
+  `degree(..., multiplicity=True)` and `degrees(..., multiplicity=True)` sum it.
+  Both default to `False`, so every existing caller keeps unique-neighbour
+  semantics, and `multiplicity=True` on a store that never opted in answers the
+  unique count rather than erroring — the argument is a readout preference, not a
+  demand the store cannot meet. A duplicate insert increments the count and
+  leaves unique degree alone; `insert_edge` still returns `Ok(false)`, because its
+  contract is "was this pair new". `delete_edge` clears the count with the pair.
+  CSR stays a set: no multi-edges. On a scoped handle a multiplicity count sums
+  visible pairs only. Duplicates whose endpoints and edge type are created in the
+  same frame count too — that is how a mirror rebuild writes — because the count
+  is resolved in the one pass that knows the frame's own ids.
+- **Snapshot `VERSION_10`, written only by a store that opted in.** The count is
+  carried by a new WAL record (discriminant **23**, appended as
+  `docs/format-stability.md` permits), and a pre-0.6.10 decoder cannot read one.
+  Left alone that would be worse than a refusal: an older binary treats the first
+  unreadable record as a corrupt WAL tail, replays only the commits before it,
+  and — `repair_wal` being the default — **persists that truncation**. So opting
+  in also stamps the snapshot at a version older binaries do not know, and writes
+  that snapshot **before** the declaration record. The snapshot is read before the
+  WAL, so an older binary stops at `snapshot: unsupported version 10` with the
+  WAL byte-unchanged. **It refuses the store by name instead of silently
+  discarding commits**, which is what the version stamp bought. V10 is V9's
+  container with a different stamp — no new section, no new field — and the
+  snapshot keeps the WAL, so every commit `open_at` could reach before the call it
+  can still reach after it. **A store that never calls `enable_multiplicity()`
+  writes V9, carries no discriminant-23 record, and stays readable by 0.6.9 —
+  and by every release back to 0.6.5, where V9 itself landed — indefinitely.**
+- **`docs/site/multiprocess.md`**, in the docs bundle: the deployment shapes that
+  are supported — one writer with N refreshing readers, and N writers serialised
+  by the advisory lock, where `Busy` after a 2 s wait means nothing was written
+  and a retry is safe — and the ones that are not. Nothing disables the lock, so
+  the page says that plainly rather than implying a configuration; what is
+  genuinely reachable is a non-mushroomdb process editing the store directory, and
+  two paths to the same directory, where the lock is held per inode. A store
+  directory on a network filesystem is not supported.
+
+#### Changed
+
+- **`NodeMask` picks its representation by density.** A visible set becomes a
+  bitset when `len * 64 >= span` (`span` being one past the largest visible id)
+  and stays a `HashSet` otherwise — read as memory rather than density, the
+  bitset is chosen precisely when it is no larger than the set it replaces, so a
+  role seeing ten nodes at the top of a ten-million-id store stays sparse by four
+  orders of magnitude. The rule is evaluated once at construction, from the
+  distinct count, and fixed for the set's life. This release puts `contains_id`
+  in the inner loop of nine more surfaces, which is what made it worth measuring;
+  `crates/core-api/tests/mask_bench.rs` is the committed measurement, over a
+  200,000-node store, release profile, five processes of 51 repetitions each:
+
+  | 200,000 nodes | 2,000 visible (stays sparse) | 50,000 visible (becomes dense) |
+  |---|---|---|
+  | `query_masked` | 1396.8 → 1374.9 µs | 7983.9 → 5685.5 µs — **−28.8%** |
+  | masked `find_similar` | 1415.7 → 1416.3 µs | 10272.0 → 7967.0 µs — **−22.4%** |
+  | `neighborhood_masked` | 2469.5 → 2474.8 µs | 2401.1 → 2392.4 µs — −0.4% |
+
+  The 2,000-id column is the control: the rule leaves that mask a `HashSet`, and
+  it is flat, which is what says the enum around the set costs nothing.
+  `neighborhood_masked` is flat at both sizes because the probe is about 1% of a
+  BFS that spends its time expanding edges and building rows. The win is where
+  the probe is the work. Hits, ordering and every existing answer are unchanged —
+  `contains_id` is a set-membership predicate, and set membership did not move.
+- **A role-token read of a store whose reader overlay will not fold now answers
+  400 naming the corruption**, where it previously answered `404 node key not
+  found`. Every other existing HTTP response is byte-identical across the move of
+  the role branches onto the engine, pinned by the route tests unedited. This one
+  is a deliberate exception: a 404 tells a caller the key is not there, so they
+  retry it or drop it and nobody learns the store is damaged.
+- **`sanitize` tests `is_ascii()` first**, which undoes a 0.6.9 regression. 0.6.9
+  widened the predicate from a bare `is_ascii_control()` to the full
+  bidi/zero-width class and paid for it on a hot path: every character of every
+  digest string fell through six `matches!` arms a plain byte can never hit. Over
+  ~400 KB of representative digest text the 0.6.9 form ran 40% slower than the
+  0.6.8 predicate it replaced — 588 µs against 420. The fast path brings it to
+  309 µs, 27% faster than 0.6.8, for identical output on every input.
+- **The `.pyi` stub says what the Rust doc comments say, and a check keeps it
+  that way.** Forty-two of the stub's docstrings were one-liners while the
+  compiled `__doc__` documented the contract — an IDE hover and a type-checker
+  read the stub. `scripts/check-pyi.sh` — run by CI beside
+  `scripts/check-claims.sh` — now fails when a stub method's docstring is a
+  single line while the Rust doc comment it stands for runs to more than three,
+  so the drift cannot silently return.
+- **`find_similar`'s exactness rule is stated where callers read it** —
+  `docs/site/api.md`, `docs/site/mcp.md` and the Python README each say that
+  **`mask=` alone, and a `scoped()` handle, are the approximate path**, and name
+  the two exact ones (`exact=True`, or a `where=` predicate). A scope deliberately
+  does *not* imply `exact`: that would silently turn a fast ANN call into an O(n)
+  GEMM for every existing masked caller. The same three places now state that a
+  `where=` predicate uses the property index only when a `label` accompanies it
+  and `(label, field)` is index-enabled — without a label it is a
+  correct-but-slower scan — and `distance = 1 - sim` is stated on the
+  `pairwise_similar` entry, which had been missing it.
+- **`docs/site/masks.md` names `scoped()` as the one scoping front door**, with
+  the "hidden is absent" contract quoted where it is defined.
+
+#### Fixed
+
+- **`insert_node` accepted a property a view owns.** Every path that *removed* a
+  view-owned property refused; creation consulted the view store nowhere, on
+  three separate paths — `GraphDb::insert_node`, `BatchOp::InsertNode`, and the
+  no-conflict arm of the new `on_conflict` insert. The store served the caller's
+  number until something touched that node and answered the view's after a
+  reopen: a `Doc` inserted with a degree view's own `deg` of `777` read `777` for
+  the life of the handle and `0` after a restart. The refusal is now at the one
+  choke-point all three pass through and comes before the duplicate-key check, so
+  the answer does not depend on what the store already holds; the `on_conflict`
+  path raises the identical **row** error on a fresh key that it already raised
+  on a taken one, rather than failing the frame.
+- **A scoped explanation never reports a weight computed over a hidden node**,
+  and evidence visibility respects the deriving rule's namespace.
+- **`get_edge_prop`, `was_linked`, `edges_at` and the two history readouts no
+  longer distinguish hidden from absent** on a scoped handle.
+- **The Python binding builds its exception after releasing the store lock.**
+  The new error classes are constructed with the interpreter attached; doing that
+  under the store mutex made `find_similar`, `pairwise_similar`, `degree` and
+  `degrees` take mutex-then-GIL while every other method took GIL-then-mutex — an
+  ABBA inversion on the one `Arc` every `scoped()` child shares, reachable from
+  any threaded caller and invisible to a single-threaded test. The three locking
+  helpers now bind the result, drop the guard, and map afterwards; a subprocess
+  test with a timeout is the regression net, and a source-reading test holds the
+  two helpers no runtime test can reach.
+- **`enable_multiplicity()` no longer loses its declaration** to a path that
+  rewrites the WAL, and a same-frame duplicate is counted rather than silently
+  skipped.
+
+#### Known limits
+
+- **The scale benchmark's two growth assertions stay red.** The build grows
+  15.48× from 2,000 to 10,000 vectors against a ceiling of 8×, and 50,000 vectors
+  take 1,018.05 s against a ceiling of 300 s. Those are the figures committed in
+  [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md);
+  nothing here re-measures them, and closing either means cutting the
+  distance-evaluation count itself.
+- **`enable_multiplicity()` is not atomic, and an exception does not undo it.**
+  The declaration record can already be in the log with only its fsync having
+  failed, and the V10 snapshot alone can be enough for the next open to finish the
+  job — so a call that raises may leave the store opted in, immediately or on the
+  next open. The failure direction is the safe one, because the V10 stamp precedes
+  the record on every path and an older binary therefore refuses such a store by
+  name rather than truncating it. But the exception means *outcome unknown*, not
+  *nothing happened*: reopen and call `is_multiplicity_enabled()` to find out
+  where the store stands. There is no call that opts a store back out.
+- **Opting in and archiving in different sessions forfeits the archive genesis
+  chain.** `enable_multiplicity()` writes a snapshot, and a store decides at its
+  **first** archive whether `open_at` may reach into archives — saying no whenever
+  a snapshot it cannot vouch for already exists. A snapshot the same handle took,
+  keeping the WAL, it can vouch for, so opting in and taking that first archive in
+  one session keeps the reach. Across sessions it does not, which is the answer
+  any store with a prior snapshot already gets.
+- **Counting costs a property lookup per neighbour.** Over 20,000 nodes at fanout
+  4 with every pair inserted twice, snapshotted and reopened,
+  `degrees(multiplicity=True)` takes 14.11 ms against 2.18 ms for the unique
+  reading — about 6.5×. Hoisting the per-row view rebuild out of the loop removed
+  2.57 ms of that; the remaining ~12 ms is inherent, being 80,000 edge-property
+  reads the unique path does not do at all. It is paid only by callers who pass
+  `multiplicity=True`, which defaults to `False` everywhere.
+- **A corrupt store is reported with two different HTTP statuses.** The shared
+  error mapping answers 400 while the role-mask path answers 500, so the same
+  store answers one or the other depending on whether the role-mask memo was
+  warm. Fixing it means changing an error mapping under every route and is
+  deferred to 0.6.11 rather than done in a release's last hours. Relatedly, a
+  full-access token can read `200 OK` from a store a role token is told is
+  corrupt: the role path folds the reader's delta tail while the full-token path
+  reads the authoritative handle, and where they disagree the `200` is the correct
+  answer.
+- **`find_similar`'s `min` defaults differently by surface.** MCP vector mode
+  defaults it to `0.8`; Python and HTTP default it to `0.0`. A call ported between
+  them without an explicit `min` changes its results silently. Both surfaces now
+  say so and name the other's value; unifying them would break one set of callers
+  without an error, so it is proposed for 0.7, where a breaking note is
+  affordable. Pass `min` explicitly.
+- **HNSW search is still approximate unless you ask otherwise.** `exact=True` or
+  a `where=` predicate force the exact GEMM path; `mask=` alone, and a `scoped()`
+  handle, ride the widening beam. `search_hybrid` takes no exactness argument at
+  all, so its vector leg is the approximate one whenever an HNSW rule covers the
+  field.
+- **A scoped handle is read-only, and a scope is a key list or a field
+  predicate — not a query.** Scoped writes would mean routing through the
+  `RoleWriteDenied` decision table, which is a larger surface than this patch;
+  dual-write through the unscoped handle instead. And a scope whose membership is
+  computed by a traversal inside the engine — the thing that would let an embedder
+  stop computing its readable set in another database — is deliberately deferred:
+  a `keys=` handle scope collapses N per-call round trips into one readable-set
+  query per request and removes the leak, but it does **not** remove that query.
+- **`scoped()` and `mask=` are cooperative, not an access boundary.** They are
+  in-process argument handling, and the MCP surface still has no auth. Real
+  enforcement is the HTTP server's role tokens, which is exactly why this release
+  moved their read contract into the engine.
+
 ## v0.6.9 — engine polish
 
 Surfaces that told the truth about themselves, mostly. Cypher's identity fields

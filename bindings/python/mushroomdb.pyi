@@ -499,6 +499,15 @@ class GraphDb:
         A store that never calls this contains no such record, keeps writing
         the old snapshot version, and stays readable by 0.6.9 indefinitely.
         Refused on a scoped handle.
+
+        **Not atomic.** If this raises, the store may be opted in anyway: the
+        record can already be in the log with only its fsync having failed, or
+        the snapshot alone can be enough for the next open to finish the job.
+        The snapshot is written first in every case, so an older binary refuses
+        such a store by name rather than truncating it — nothing is lost. But
+        the exception means "outcome unknown", not "nothing happened": reopen
+        and call `is_multiplicity_enabled()` to find out where the store stands.
+        There is no call that opts it back out.
         """
 
     def is_multiplicity_enabled(self) -> bool:

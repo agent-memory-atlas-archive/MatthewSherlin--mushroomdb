@@ -160,6 +160,30 @@ So the downgrade path after opting in is a clean, named refusal rather than lost
 commits. It is still one-way: an older binary cannot read the store, and no call
 puts it back. Opt in when you want the feature, not by default.
 
+##### `enable_multiplicity()` is not atomic, and `Err` does not undo it
+
+The ordering above is the property the design rests on. Atomicity is not, and
+the call does not have it. A failed `enable_multiplicity()` reports `Err` and
+leaves that handle reporting `is_multiplicity_enabled() == false`, but the store
+can still be opted in — immediately, or from its next open:
+
+- The declaration is appended to `wal.bin` and *then* fsynced. A failed barrier
+  leaves the record on disk; the next open replays it and the store is opted in.
+- If the declaration never landed but the V10 snapshot did, and the store
+  already had a WAL archive, the open-time recovery for a WAL renamed away
+  mid-archive treats a V10 stamp beside an archive as an interrupted opt-in and
+  opts the store in.
+
+Neither costs a reader anything, and that is the point: the V10 stamp is written
+first, so every reachable intermediate state is one an older binary refuses by
+name. The failure direction spends a refusal, never a commit. What it does mean
+is that **`Err` from this call means "outcome unknown", not "nothing happened"**.
+Reopen the store and ask `is_multiplicity_enabled()`.
+
+One case does leave the store opted out: a failure with no archive present and
+no record written. A stray V10 snapshot remains, and that store's next snapshot
+rewrites it at V9.
+
 Which `Intern` records a `Batch` frame carries, and where they sit inside it,
 is **not** part of the format contract — only that replaying a frame's records
 in order reproduces the write-time symbol assignment. Since v0.5.0 a `Batch`

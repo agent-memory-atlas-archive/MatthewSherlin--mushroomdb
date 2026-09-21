@@ -2502,17 +2502,46 @@ impl<F: Fs> GraphDb<F> {
         // the archives still carried discriminant 23, which is the exact state
         // the V10 stamp exists to prevent.
         //
-        // The stamp closes it, and closes it by construction rather than by
-        // narrowing a window. An archive exists only because `snapshot_with`
-        // took one, and that same call stamps the snapshot from `multiplicity`
-        // *before* it touches the WAL. So a V10 snapshot standing next to an
-        // archive is proof the store was opted in when the archive was made, and
-        // therefore that the archived WAL carries the declaration — whatever
-        // became of the live one. No ordering inside the archive sequence, and
-        // no crash within it, can make that evidence disagree.
+        // The V10 stamp is what carries the conclusion. The archive clause is a
+        // scope restriction, not a second proof — an earlier version of this
+        // comment, and defect #22, claimed otherwise, and defect #33 corrects
+        // it. Taking the two in order:
         //
-        // `list_archives` is only reached on a store already stamped V10 whose
-        // WAL did not declare, which is the interrupted case and nothing else.
+        // **The stamp.** `snapshot_with` stamps the snapshot from
+        // `self.multiplicity` *before* it touches the WAL, and nothing rewrites
+        // a V10 snapshot at V9 while the store believes it is opted in. So a
+        // V10 stamp says this store reached `enable_multiplicity` far enough to
+        // write the snapshot — and, decisively, that every older binary already
+        // refuses this store by name. Opting in here can cost such a reader
+        // nothing it was not already being told.
+        //
+        // **What the archive clause does not prove.** It is *not* evidence that
+        // the archive was taken while the store was opted in. A store can
+        // archive at V9 and opt in afterwards, leaving a V10 snapshot standing
+        // beside an archive whose WAL carries no declaration at all — see
+        // `a_failed_opt_in_beside_an_archive_comes_back_opted_in`. The inference
+        // held in the success case by coincidence, not by construction.
+        //
+        // **What it does buy: scope.** Without it the recovery would also fire
+        // on a store that reached the V10 snapshot write and then failed with no
+        // archive in sight. That store must stay opted out, and can: no WAL was
+        // renamed away, nothing carries discriminant 23, and its next snapshot
+        // rewrites at V9, which puts it back within reach of every older reader.
+        // An archive is the marker for the one state that is not recoverable
+        // that way — a WAL renamed away that may hold the only copy of the
+        // declaration. `no_crash_leaves_discriminant_23_unguarded` pins that
+        // line: it sweeps a workload with no archives at all and refuses a
+        // V10-implies-enabled rule.
+        //
+        // **The invariant, whichever way the clause goes:** the recovery never
+        // opts in a store whose snapshot is not V10. A V9 store has made no
+        // promise to an older reader, so opting it in would start writing
+        // discriminant 23 behind a stamp that does not guard it. Pinned by
+        // `the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10` and
+        // `the_recovery_does_not_opt_a_store_in_by_itself`.
+        //
+        // What this recovery cannot do is make the opt-in atomic; it is not,
+        // and `enable_multiplicity` says so. See defects #32-#34.
         if !db.multiplicity
             && snapshot_version == Some(core_storage::snapshot::VERSION_10)
             && !db.fs.list_archives()?.is_empty()
@@ -7024,12 +7053,48 @@ impl<F: Fs> GraphDb<F> {
     /// Calling it on a store that has already opted in writes nothing and
     /// returns `Ok(())`: an operator should not have to ask first.
     ///
+    /// # This call is not atomic, and an `Err` does not undo it
+    ///
+    /// There is no rollback here, and there never was one. An `Err` means this
+    /// handle stopped believing the store is opted in — `self.multiplicity` is
+    /// reset, so this handle reports `false` from then on — and nothing more. It
+    /// says nothing about what reached disk. Two reachable failures leave the
+    /// opt-in standing:
+    ///
+    /// * **The declaration landed and only its fsync failed.** `log_then_apply`
+    ///   appends, then syncs; a failed barrier leaves `MULTIPLICITY_ENABLED`
+    ///   already in `wal.bin`. The next open replays it and the store is opted
+    ///   in. No archive is involved — this one predates the recovery below.
+    /// * **The declaration never landed, but the V10 snapshot did, on a store
+    ///   that already had an archive.** The open-time recovery in
+    ///   `load_from_disk` reads V10-beside-an-archive as an interrupted archive
+    ///   sequence and opts the store in.
+    ///
+    /// So a failed call may leave the opt-in on disk immediately (the first
+    /// case) or conjure it at the next open (the second), and nothing puts the
+    /// store back out. Treat `Err` as "the outcome is unknown", not as "nothing
+    /// happened".
+    ///
+    /// **This is safe, and the ordering is the reason.** The V10 stamp is
+    /// written *before* the declaration, so every one of these intermediate
+    /// states is one an older binary refuses by name rather than truncates at.
+    /// The failure direction costs a refusal, never a commit. That ordering is
+    /// the property worth protecting, not the atomicity this call never had.
+    ///
+    /// **To know where the store stands, ask the store.** Reopen it and call
+    /// [`is_multiplicity_enabled`](Self::is_multiplicity_enabled); that is the
+    /// only answer that accounts for what reached disk.
+    ///
+    /// The one case that really does leave the store opted out is a failure with
+    /// no archive present and no record written: a stray V10 snapshot remains,
+    /// costing an older reader a refusal it did not strictly need, and *that*
+    /// store's next snapshot rewrites at V9.
+    ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
-    /// - Anything [`snapshot_with`](Self::snapshot_with) can return: the store
-    ///   is left opted *out* (a V10 snapshot may remain on disk, which only
-    ///   costs an older reader a refusal it did not strictly need, and which the
-    ///   next snapshot rewrites at V9).
+    /// - Anything [`snapshot_with`](Self::snapshot_with) can return, and
+    ///   anything the WAL append or its fsync can return. See the atomicity
+    ///   section above for what the store is left holding.
     pub fn enable_multiplicity(&mut self) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -7058,9 +7123,16 @@ impl<F: Fs> GraphDb<F> {
             })
             .and_then(|()| self.log_then_apply(core_storage::wal::MULTIPLICITY_ENABLED));
         if forced.is_err() {
-            // Nothing was declared, so nothing is enabled. A V10 snapshot may
-            // still be on disk; it costs an older reader a refusal it did not
-            // strictly need, which is the safe direction to fail in.
+            // This handle stops believing it is opted in. That is all this line
+            // does — it is not a rollback, and cannot be one: the declaration
+            // may already be in `wal.bin` (the append succeeded and only the
+            // fsync failed), and even when it is not, the V10 snapshot beside an
+            // existing archive is enough for the open-time recovery to opt the
+            // store in. See the "not atomic" section on this method.
+            //
+            // It fails in the safe direction either way: the V10 stamp reached
+            // disk before anything a v0.6.9 reader would truncate at, so the
+            // worst an interruption costs that reader is a refusal by name.
             self.multiplicity = false;
         }
         forced

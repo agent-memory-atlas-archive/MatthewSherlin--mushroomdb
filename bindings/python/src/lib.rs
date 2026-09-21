@@ -988,6 +988,14 @@ impl GraphDb {
     /// store by name instead of silently truncating its write-ahead log. On a
     /// large store this costs one full snapshot write. History stays reachable:
     /// the snapshot keeps the log rather than truncating it.
+    ///
+    /// **It is not atomic.** If it raises, the store may be opted in anyway —
+    /// the record can already be in the log with only its durability barrier
+    /// having failed, or the snapshot can be enough on its own for the next
+    /// open to finish the job. Every such state is one an older binary refuses
+    /// by name rather than truncates, so nothing is lost; but the exception
+    /// means "outcome unknown", not "nothing happened". Reopen the store and
+    /// call `is_multiplicity_enabled()` to find out where it stands.
     #[pyo3(text_signature = "($self)")]
     fn enable_multiplicity(&self) -> PyResult<()> {
         self.with_mut(|db| db.enable_multiplicity())

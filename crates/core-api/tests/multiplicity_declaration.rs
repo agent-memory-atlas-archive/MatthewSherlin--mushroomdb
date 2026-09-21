@@ -17,6 +17,17 @@
 //! * **#23** — opting in must not cost the store its archive genesis chain.
 //! * **#24** — a duplicate edge whose endpoints are created in the *same* frame
 //!   must be counted; that shape is the primary ingest shape, not a corner.
+//!
+//! The sixth pass added three more, and they point the other way: the opt-in is
+//! **not atomic**, and the tests below assert what the code does rather than
+//! what its docstring promised.
+//!
+//! * **#32** — a failed `enable_multiplicity()` beside an existing archive comes
+//!   back opted *in* on the next open.
+//! * **#33** — the recovery's predicate, and the one invariant it must keep: it
+//!   never opts in a store whose snapshot is not V10.
+//! * **#34** — the rollback was never reliable: append precedes fsync, so a
+//!   failed barrier leaves the declaration durable with no archive in sight.
 
 use core_api::{AlgoDir, GraphDb, SnapshotOptions};
 use core_storage::fs::{FileId, Fs};
@@ -60,6 +71,13 @@ enum FailAt {
     GenesisMarker,
     /// The baseline WAL write itself, the last call in the sequence.
     BaselineWal,
+    /// The `append` of `MULTIPLICITY_ENABLED` itself, inside
+    /// `enable_multiplicity`'s `log_then_apply` — i.e. after the V10 snapshot
+    /// is already on disk and before any record is. Used by #32.
+    DeclarationAppend,
+    /// The fsync that follows a **successful** append of that record. The frame
+    /// is already in `wal.bin`; only the durability barrier failed. Used by #34.
+    DeclarationSync,
 }
 
 /// A filesystem that fails one named call exactly once and then works normally.
@@ -76,6 +94,10 @@ struct FailOnce {
     /// Set once the live WAL has been renamed away, so the baseline-write
     /// target does not fire on an unrelated earlier `write_atomic`.
     archived: Cell<bool>,
+    /// Set once a frame carrying `MULTIPLICITY_ENABLED` has actually landed, so
+    /// the `DeclarationSync` target fires on that record's barrier and not on an
+    /// unrelated earlier one.
+    declared: Cell<bool>,
 }
 
 impl FailOnce {
@@ -85,6 +107,7 @@ impl FailOnce {
             at,
             fired: Cell::new(false),
             archived: Cell::new(false),
+            declared: Cell::new(false),
         }
     }
 
@@ -104,9 +127,20 @@ impl FailOnce {
 
 impl Fs for FailOnce {
     fn append(&mut self, file: FileId, data: &[u8]) -> std::io::Result<()> {
-        self.inner.append(file, data)
+        let declares = file == FileId::Wal && frame_declares_multiplicity(data);
+        if declares && self.should_fail(FailAt::DeclarationAppend) {
+            return Err(Self::err());
+        }
+        self.inner.append(file, data)?;
+        if declares {
+            self.declared.set(true);
+        }
+        Ok(())
     }
     fn sync(&mut self, file: FileId) -> std::io::Result<()> {
+        if file == FileId::Wal && self.declared.get() && self.should_fail(FailAt::DeclarationSync) {
+            return Err(Self::err());
+        }
         self.inner.sync(file)
     }
     fn read(&self, file: FileId) -> std::io::Result<Vec<u8>> {
@@ -150,6 +184,24 @@ impl Fs for FailOnce {
     fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
         self.inner.delete_genesis_marker()
     }
+}
+
+/// Whether a framed WAL byte string carries the opt-in **declaration**
+/// specifically, as opposed to a count for a real pair. Both are discriminant
+/// 23; only this one turns the store's format over.
+fn frame_declares_multiplicity(bytes: &[u8]) -> bool {
+    let (frames, _) = decode_all(bytes);
+    frames.iter().any(|f| match f {
+        WalRecord::Batch(inner) => inner.iter().any(|r| r.is_multiplicity_decl()),
+        r => r.is_multiplicity_decl(),
+    })
+}
+
+/// The version stamped on a survivor's `snapshot.bin`, or `None` when there is
+/// no snapshot at all.
+fn snapshot_version<F: Fs>(fs: &F) -> Option<u16> {
+    core_storage::snapshot::peek_version(&fs.read(FileId::Snapshot).unwrap_or_default())
+        .unwrap_or(None)
 }
 
 /// Whether a WAL byte string carries any discriminant-23 frame — the record a
@@ -296,6 +348,163 @@ fn the_recovery_does_not_opt_a_store_in_by_itself() {
     assert!(
         !reopened.is_multiplicity_enabled(),
         "an archive alone must not opt a store in"
+    );
+}
+
+// ── #32/#33/#34: the opt-in is not atomic, and the docs now say so ───────────
+
+/// **#32.** `enable_multiplicity()` is **not atomic**, and a store that already
+/// archived is the sharpest case: the call returns `Err`, reports the store
+/// opted out, and the *next open* opts it in anyway.
+///
+/// The sequence is ordinary. Archive once while opted out — V9 snapshot, one
+/// archive, no declaration anywhere. Then call `enable_multiplicity()`: it
+/// stamps the V10 snapshot first (that ordering is the guard and must stay), and
+/// then fails before the declaration reaches the WAL. Nothing on disk says
+/// "opted in" — but the recovery reads V10-beside-an-archive as if it did.
+///
+/// This test asserts what the code **does**, not what the docstring used to
+/// promise. The promise ("left opted *out*", "the next snapshot rewrites at V9")
+/// is what is wrong here; the behaviour is safe, because the V10 stamp reached
+/// disk before anything a v0.6.9 reader would truncate at.
+#[test]
+fn a_failed_opt_in_beside_an_archive_comes_back_opted_in() {
+    let mut db = GraphDb::open_with(FailOnce::new(FailAt::DeclarationAppend)).unwrap();
+    db.insert_node("N", "a", vec![]).unwrap();
+    db.insert_node("N", "b", vec![]).unwrap();
+
+    // Archive while still opted out: this archive was taken by a store that was
+    // *not* counting, which is what makes #33's inference unsound.
+    db.snapshot_with(opts_archive()).unwrap();
+
+    let err = db.enable_multiplicity().unwrap_err();
+    assert!(
+        err.to_string().contains("injected transient failure"),
+        "fixture: the declaration append must fail; got {err}"
+    );
+    assert!(
+        !db.is_multiplicity_enabled(),
+        "the failed call reports the store opted out, on this handle"
+    );
+
+    let survivor = db.into_fs().inner.surviving_state();
+    assert_eq!(
+        snapshot_version(&survivor),
+        Some(10),
+        "fixture: the V10 stamp went first and landed — the safe direction"
+    );
+    let archives = survivor.list_archives().unwrap();
+    assert_eq!(archives.len(), 1, "fixture: one archive, taken at V9");
+    assert!(
+        !has_discriminant_23(&survivor.read_archive(archives[0]).unwrap()),
+        "fixture: the archive predates the opt-in, so it carries no record — \
+         the counterexample to 'V10 beside an archive proves the archive was \
+         made while opted in'"
+    );
+    assert!(
+        !frame_declares_multiplicity(&survivor.read(FileId::Wal).unwrap()),
+        "fixture: no declaration reached the live WAL either"
+    );
+
+    let reopened = GraphDb::open_with(survivor).unwrap();
+    assert!(
+        reopened.is_multiplicity_enabled(),
+        "the recovery completes an opt-in that returned Err: the call is not \
+         atomic, and `enable_multiplicity`'s docs must say so"
+    );
+}
+
+/// **#34.** The rollback was unreliable before the recovery existed, and still
+/// is without any archive in sight. `log_then_apply` appends, *then* fsyncs: a
+/// failed barrier leaves `MULTIPLICITY_ENABLED` already in `wal.bin` while the
+/// call sets `self.multiplicity = false` and returns `Err`. The next open
+/// replays the record and the store is opted in.
+///
+/// No archive, so the recovery clause plays no part — this is the append/sync
+/// ordering alone.
+#[test]
+fn a_failed_opt_in_whose_record_reached_the_wal_comes_back_opted_in() {
+    let mut db = GraphDb::open_with(FailOnce::new(FailAt::DeclarationSync)).unwrap();
+    db.insert_node("N", "a", vec![]).unwrap();
+
+    let err = db.enable_multiplicity().unwrap_err();
+    assert!(
+        err.to_string().contains("injected transient failure"),
+        "fixture: the declaration's fsync must fail; got {err}"
+    );
+    assert!(
+        !db.is_multiplicity_enabled(),
+        "the failed call reports the store opted out, on this handle"
+    );
+
+    let survivor = db.into_fs().inner.surviving_state();
+    assert!(
+        survivor.list_archives().unwrap().is_empty(),
+        "fixture: no archive — the recovery clause cannot be what opts this in"
+    );
+    assert!(
+        frame_declares_multiplicity(&survivor.read(FileId::Wal).unwrap()),
+        "fixture: the append succeeded, so the record is already on disk"
+    );
+    assert_eq!(
+        snapshot_version(&survivor),
+        Some(10),
+        "and the stamp still precedes it, which is why this is safe"
+    );
+
+    let reopened = GraphDb::open_with(survivor).unwrap();
+    assert!(
+        reopened.is_multiplicity_enabled(),
+        "plain WAL replay opts the store in: the rollback was never reliable"
+    );
+}
+
+/// **#33, the invariant the predicate must preserve.** Whatever else the
+/// recovery does, it must never opt in a store whose snapshot is not V10 — a
+/// store stamped V9 has made no promise to an older reader, so opting it in
+/// would start writing discriminant 23 behind a stamp that does not guard it.
+///
+/// This is the mutation killer for the version clause: drop
+/// `snapshot_version == Some(VERSION_10)`, or widen it to `.is_some()`, and
+/// every reopen below comes back opted in.
+#[test]
+fn the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10() {
+    let mut fs = {
+        let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap();
+        db.insert_node("N", "b", vec![]).unwrap();
+        db.into_fs()
+    };
+
+    // Three successive archives, all taken by a store that never opted in. Each
+    // reopen must stay opted out no matter how many archives stand beside the
+    // V9 stamp.
+    for round in 0..3 {
+        let mut db = GraphDb::open_with(fs).unwrap();
+        assert!(
+            !db.is_multiplicity_enabled(),
+            "round {round}: a V9 snapshot beside {round} archives must not opt in"
+        );
+        db.insert_node("N", &format!("n{round}"), vec![]).unwrap();
+        db.snapshot_with(opts_archive()).unwrap();
+        fs = db.into_fs();
+        assert_eq!(
+            snapshot_version(&fs),
+            Some(9),
+            "round {round}: fixture — an opted-out store archives at V9"
+        );
+        assert_eq!(
+            fs.list_archives().unwrap().len(),
+            round + 1,
+            "round {round}: fixture — the archives accumulate"
+        );
+    }
+
+    let reopened = GraphDb::open_with(fs).unwrap();
+    assert!(
+        !reopened.is_multiplicity_enabled(),
+        "the V10 stamp is what carries the conclusion; without it the archives \
+         say nothing"
     );
 }
 

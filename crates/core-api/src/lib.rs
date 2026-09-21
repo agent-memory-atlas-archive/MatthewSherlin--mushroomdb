@@ -6,6 +6,7 @@ mod ingest;
 pub mod mask;
 pub mod reader;
 pub mod repograph;
+pub mod restore;
 pub mod roles;
 pub mod schema;
 mod shared;
@@ -24,27 +25,37 @@ pub use core_rules::{
 };
 pub use core_storage::fs::RealFs;
 pub use core_storage::{Direction, GraphError, Result, Value};
+pub use db::{
+    ambiguous_exactness_last_warning, ambiguous_exactness_warns, ambiguous_exactness_warns_reset,
+};
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use db::{
     snapshot_version_at, valid_namespace, write_snapshot_bak, AsOfScope, BackupReport,
-    BatchBuilder, BatchOp, DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge, FsyncPolicy,
-    GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats, NodeInfo, NodeRef,
-    OpenOptions, Precondition, PredicateSummary, RuleStats, SlowQueryEntry, SlowQuerySnapshot,
-    SnapshotOptions, Stats, WhatIf, WriteAuthz, MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT,
-    NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
+    BatchBuilder, BatchOp, BatchOutcome, DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge,
+    FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats, NodeInfo,
+    NodeRef, OnConflict, OpenOptions, Precondition, PredicateSummary, RuleStats, SlowQueryEntry,
+    SlowQuerySnapshot, SnapshotOptions, Stats, WhatIf, WriteAuthz,
+    MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT, NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
 pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};
 
-/// Current on-disk snapshot format version written by this build.
+/// The on-disk snapshot version a store that has opted in to nothing writes —
+/// the **floor**, not the whole answer.
 ///
 /// Exposed so CLI and tooling can print `V<SNAPSHOT_VERSION>` without depending
 /// directly on `core-storage`.
+///
+/// Since v0.6.10 this build writes 9 **or** 10 depending on the store
+/// (`core_storage::snapshot::version_for`: a store that has called
+/// `GraphDb::enable_multiplicity` writes 10) and reads 5 through 10. Compare a
+/// store's stamp against this with `>=`, never `==` — see `cli::run_migrate`,
+/// which would otherwise report an opted-in store as `V10 -> V9`.
 pub const SNAPSHOT_VERSION: u16 = core_storage::snapshot::VERSION;
 pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, HistoryResult};
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
-pub use mask::{MaskMode, NodeMask, RoleMaskCache};
+pub use mask::{MaskMode, NodeMask, RoleMaskCache, Scope};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
 pub use roles::{PropPredicate, RoleDef, WriteScope};
 pub use schema::{Schema, SchemaDiff};

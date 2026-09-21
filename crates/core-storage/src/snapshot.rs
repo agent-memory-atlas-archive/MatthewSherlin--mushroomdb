@@ -28,8 +28,102 @@ pub const VERSION_8: u16 = 8;
 /// drop every string property.  Refusing the open with `snapshot: unsupported
 /// version 9` is the point of the bump.
 pub const VERSION_9: u16 = 9;
-/// Current default encoding version.
+/// V10: the V9 container, byte for byte, written by a store that has opted in
+/// to insert-count multiplicity.
+///
+/// Nothing about the layout moves — same `GDB1` magic, same 4 KB header page,
+/// same thirteen sections, same per-section CRC — and `decode` reads V8, V9 and
+/// V10 through one path. The version carries one fact and no data: *this store
+/// writes WAL discriminant 23.*
+///
+/// It exists because mushroomdb's two formats fail in opposite directions. An
+/// unknown snapshot version is refused by name. An unknown WAL discriminant is
+/// not: [`decode_all`](crate::decode_all) treats a frame it cannot deserialise
+/// as a corrupt tail and returns the valid prefix, and a repairing open writes
+/// that truncation back. A pre-v0.6.10 binary opening a multiplicity-enabled
+/// store would therefore lose every commit after the opt-in, and persist the
+/// loss — worse than any refusal, and precisely when a downgrade is what an
+/// operator needs.
+///
+/// The snapshot is read before the WAL, so putting the loud failure in front of
+/// the silent one is enough: an older reader stops at `snapshot: unsupported
+/// version 10` and never opens the WAL it would have truncated.
+///
+/// A store that never opts in keeps writing [`VERSION_9`] and stays readable by
+/// v0.6.9 indefinitely. See [`version_for`].
+pub const VERSION_10: u16 = 10;
+/// Current default encoding version — what a store that has opted in to nothing
+/// writes. [`version_for`] is what decides per store.
 pub const VERSION: u16 = VERSION_9;
+
+/// The versions that share the mmap-able V8 container, oldest first.
+///
+/// V9 added section 12 and V10 added nothing but its own stamp, so one header
+/// parser and one decode path serve all three. Every reader that decides
+/// whether a snapshot can be mapped zero-copy asks this — the open path, the
+/// as-of path and [`crate::v8::MappedBase`] — so the answer cannot drift
+/// between them. A version missing here is read through the full-decode path
+/// instead, which is correct but loads the whole graph onto the heap.
+///
+/// **This list is the only place the set is written down.** [`decode`]'s
+/// container arm is a `match` *guard* calling [`is_mmap_container`] rather than
+/// an arm listing the versions, so adding the next container version is one
+/// edit here and nothing else. A slice, not a fixed-size array, so the length
+/// is not a second thing to keep in step.
+pub const MMAP_CONTAINER_VERSIONS: &[u16] = &[VERSION_8, VERSION_9, VERSION_10];
+
+/// Whether `version` is one of the [`MMAP_CONTAINER_VERSIONS`].
+pub fn is_mmap_container(version: u16) -> bool {
+    MMAP_CONTAINER_VERSIONS.contains(&version)
+}
+
+/// The snapshot version a store must be written at.
+///
+/// `multiplicity` is the only thing that moves it today: a store that records
+/// insert-count multiplicity writes [`VERSION_10`] so that a reader which does
+/// not know WAL discriminant 23 refuses the open instead of truncating the WAL.
+/// Every other store writes [`VERSION_9`] — that is the property the downgrade
+/// path rests on, and it is not a default to be widened casually.
+pub fn version_for(multiplicity: bool) -> u16 {
+    if multiplicity {
+        VERSION_10
+    } else {
+        VERSION_9
+    }
+}
+
+/// Rewrite the version stamp of an encoded V8-family container in place,
+/// repairing the whole-header CRC that covers it.
+///
+/// V8, V9 and V10 are the same container; which of them a snapshot *is* comes
+/// down to two bytes in the header. The encoder builds the header once, so the
+/// choice lives here, next to the version constants, rather than being threaded
+/// through every section writer.
+///
+/// # Errors
+/// [`GraphError::Corrupt`] if `buf` is not a well-formed container header.
+pub fn stamp_container_version(buf: &mut [u8], version: u16) -> Result<()> {
+    // Header layout (mirrored from `v8::encode::encode_v8` / `v8::parse_header`):
+    //   [0..4] magic, [4..6] version, [6..8] section_count,
+    //   [8..8+16*N] directory, [8+16*N..+4] CRC32 over [0..8+16*N].
+    if buf.len() < crate::v8::HEADER_SIZE || buf[0..4] != MAGIC {
+        return Err(GraphError::Corrupt {
+            detail: "snapshot: cannot stamp a version onto a non-container buffer".into(),
+        });
+    }
+    // Infallible: `buf.len() >= HEADER_SIZE` checked above; both slices are exactly 2 bytes.
+    let section_count = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
+    let dir_end = 8 + section_count * 16;
+    if dir_end + 4 > crate::v8::HEADER_SIZE {
+        return Err(GraphError::Corrupt {
+            detail: format!("snapshot: {section_count} sections overflow the header page"),
+        });
+    }
+    buf[4..6].copy_from_slice(&version.to_le_bytes());
+    let crc = crc32fast::hash(&buf[0..dir_end]);
+    buf[dir_end..dir_end + 4].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
 
 /// IVF state for one side (src or dst) of a single approximate rule.
 /// Persisted in V4 snapshots so `open()` can restore cluster assignments
@@ -256,9 +350,20 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
         VERSION_5 => decode_v5(&bytes[6..]),
         VERSION_6 => decode_v6(&bytes[6..]),
         VERSION_7 => decode_v7(&bytes[6..]),
-        // V8 and V9 are the same file-based container; `decode_v8_from_mapped`
-        // reads the shared string section when the directory carries one.
-        VERSION_8 | VERSION_9 => {
+        // The mmap-able container family shares one decode path;
+        // `decode_v8_from_mapped` reads the shared string section when the
+        // directory carries one. V9 added section 12 and V10 added nothing at
+        // all — it only declares that the store's WAL may carry discriminant
+        // 23.
+        //
+        // A guard, not an arm listing the versions: a `match` guard *can* call
+        // a function, and `MMAP_CONTAINER_VERSIONS` is then the single place
+        // the set is written down. Listing them here again is how a version
+        // gets added to the encoder and to the header parser but not to the
+        // decoder, producing a store this binary writes and then refuses to
+        // open. `every_version_the_encoder_writes_is_mmap_able` could not have
+        // caught that: it never reaches this function.
+        v if is_mmap_container(v) => {
             let mapped = crate::v8::MappedBase::from_bytes(bytes.to_vec())?;
             decode_v8_from_mapped(&mapped)
         }
@@ -571,5 +676,114 @@ mod tests {
         );
         assert_eq!(back9.topo.edge_count(), 1);
         assert_eq!(back9.labels, vec![back9.syms.get("N").unwrap(); 2]);
+    }
+
+    /// V10 is V9's bytes with two header bytes moved. Stamping one into the
+    /// other must leave a container the decoder reads identically — the version
+    /// carries a fact about the store's WAL, never any data of its own.
+    #[test]
+    fn v10_is_v9_with_a_different_stamp() {
+        let state = tiny_state();
+        let v9 = encode(&state).unwrap();
+        let mut v10 = v9.clone();
+        stamp_container_version(&mut v10, VERSION_10).unwrap();
+
+        assert_eq!(peek_version(&v10).unwrap(), Some(VERSION_10));
+        assert_eq!(v9.len(), v10.len(), "the stamp must not resize the file");
+        // Only the version field and the header CRC differ.
+        let diffs: Vec<usize> = (0..v9.len()).filter(|&i| v9[i] != v10[i]).collect();
+        assert!(
+            diffs
+                .iter()
+                .all(|&i| (4..6).contains(&i) || i < crate::v8::HEADER_SIZE),
+            "the stamp must touch nothing outside the header page: {diffs:?}"
+        );
+
+        let back = decode(&v10).unwrap().unwrap();
+        assert_eq!(back.ids.get("b"), Some(1));
+        assert_eq!(back.props.get(1, "name"), Some(&Value::Str("bob".into())));
+        assert_eq!(back.topo.edge_count(), 1);
+
+        // And back again: the stamp is not one-way at the byte level.
+        let mut round = v10.clone();
+        stamp_container_version(&mut round, VERSION_9).unwrap();
+        assert_eq!(round, v9, "restamping V9 must reproduce the original bytes");
+    }
+
+    /// `version_for` is the single place the encoder's choice is made, and its
+    /// default is the one the downgrade path depends on.
+    #[test]
+    fn only_multiplicity_moves_the_version() {
+        assert_eq!(version_for(false), VERSION_9);
+        assert_eq!(version_for(true), VERSION_10);
+        assert_eq!(VERSION, VERSION_9);
+    }
+
+    /// Every version the encoder can write must be mappable, or the store it
+    /// wrote would come back through the full-decode path and land the whole
+    /// graph on the heap.
+    #[test]
+    fn every_version_the_encoder_writes_is_mmap_able() {
+        for multiplicity in [false, true] {
+            let v = version_for(multiplicity);
+            assert!(
+                is_mmap_container(v),
+                "V{v} is written but not in MMAP_CONTAINER_VERSIONS"
+            );
+        }
+        assert!(!is_mmap_container(VERSION_7));
+        assert!(!is_mmap_container(VERSION_10 + 1));
+    }
+
+    /// `decode`'s dispatch must agree with `MMAP_CONTAINER_VERSIONS` — over
+    /// versions that do not exist yet, which is where the drift would be.
+    ///
+    /// The test above compares two constants in this file that would be edited
+    /// in the same breath; it never calls `decode`. This one does, on real
+    /// restamped container bytes, and that is the copy of the list that would
+    /// actually be forgotten: before `decode`'s arm became a guard it spelled
+    /// the three versions out, so a V11 added to `version_for` and to
+    /// `MMAP_CONTAINER_VERSIONS` and nowhere else produced a store this binary
+    /// writes and then refuses to open, with every test in this file green.
+    ///
+    /// Green before the guard landed as well as after — the arm listed exactly
+    /// the three versions the list holds, so today the two agree either way.
+    /// What it buys is the *next* version: it fails the moment the list gains a
+    /// member `decode` will not take, which under the guard cannot happen and
+    /// without it was one forgotten edit away.
+    #[test]
+    fn decode_dispatch_matches_the_container_list() {
+        let state = tiny_state();
+        let v9 = encode(&state).unwrap();
+
+        // Sweep past the versions that exist: 11..=16 are the ones a later
+        // release will claim, and they must track the list, not a literal.
+        for v in 0u16..=16 {
+            let mut buf = v9.clone();
+            // V5-V7 are a different container shape entirely; restamping V9's
+            // bytes to one of them asks `decode` to read them as that format,
+            // which is exactly the "not a container" answer under test.
+            if stamp_container_version(&mut buf, v).is_err() {
+                continue;
+            }
+            let decoded_ok = decode(&buf).map(|s| s.is_some()).unwrap_or(false);
+            assert_eq!(
+                decoded_ok,
+                is_mmap_container(v),
+                "V{v}: is_mmap_container says {}, but decode {} it — \
+                 decode's dispatch and MMAP_CONTAINER_VERSIONS have drifted",
+                is_mmap_container(v),
+                if decoded_ok { "accepted" } else { "refused" }
+            );
+        }
+    }
+
+    /// A buffer that is not a container is refused rather than corrupted.
+    #[test]
+    fn stamping_a_non_container_is_an_error() {
+        let mut junk = vec![0u8; crate::v8::HEADER_SIZE];
+        assert!(stamp_container_version(&mut junk, VERSION_10).is_err());
+        let mut short = MAGIC.to_vec();
+        assert!(stamp_container_version(&mut short, VERSION_10).is_err());
     }
 }

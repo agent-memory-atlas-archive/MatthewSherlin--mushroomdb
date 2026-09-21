@@ -23,23 +23,35 @@ document is the binding contract for how the snapshot and WAL formats evolve.
 | V6 | zstd-compressed V5 payload |
 | V7 | zstd(CRC32 + packed CSR topology + packed columnar properties + bincode meta) |
 | V8 | mmap-able zero-copy rkyv sections; every string column carries a full copy of the string table |
-| V9 (current) | V8's container with one shared string table (section 12); every string column's own table is empty |
+| V9 (default) | V8's container with one shared string table (section 12); every string column's own table is empty |
+| V10 | V9's container, byte for byte. Written only by a store that has called `enable_multiplicity()`; it declares that the store's WAL may carry discriminant 23 |
 
-The current encoder always writes **V9**. The decoder supports V5, V6, V7, V8, and V9.
-V5–V8 stores are **automatically migrated** to V9 on `GraphDb::open` (see Automatic migration below).
+The current encoder writes **V9** for every store, and **V10** only for a store
+that has opted in to insert-count multiplicity. The decoder supports V5 through
+V10. V5–V8 stores are **automatically migrated** to V9 on `GraphDb::open` (see
+Automatic migration below); a V10 store is already current and is never
+rewritten down.
 
-V8 and V9 are the *same container* — same magic, header page, directory entries
-and per-section CRC — and both decode through `MappedBase`. The version still
-moves because the change is not backward-safe in the other direction: a V8
-reader opening a V9 snapshot would find every string column's own table empty
-and silently drop every string property. It refuses with
-`snapshot: unsupported version 9` instead.
+V8, V9 and V10 are the *same container* — same magic, header page, directory
+entries and per-section CRC — and all three decode through `MappedBase`. The
+version still moves each time, because each step is not backward-safe:
 
-#### V9 wire description
+- A V8 reader opening a V9 snapshot would find every string column's own table
+  empty and silently drop every string property. It refuses with
+  `snapshot: unsupported version 9` instead.
+- A pre-v0.6.10 reader opening a V10 store would meet WAL discriminant 23 and
+  truncate the WAL at it (see *Discriminant 23 is opt-in* below). It refuses
+  with `snapshot: unsupported version 10` instead, and never opens the WAL.
+
+V10 adds no section, no field and no byte of data. Which version a snapshot is
+written at is decided in one place, `snapshot::version_for(multiplicity)`.
+
+#### V9 / V10 wire description
 
 ```text
 [0..4]         magic "GDB1"
-[4..6]         VERSION = 9 (u16 LE); V8 wrote 8 into the same container
+[4..6]         VERSION = 9, or 10 on a multiplicity-enabled store (u16 LE);
+               V8 wrote 8 into the same container
 [6..8]         section_count (u16 LE) — currently 13
 [8..8+16*N]    section directory: N × { id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32 }
 [8+16*N..+4]   whole-header CRC32 (covers bytes [0..8+16*N])
@@ -105,9 +117,72 @@ the snapshot file, or periodically as a sanity check on storage hardware.
 
 ### WAL (`wal.bin`)
 
-WAL record discriminants 0–22 are append-only: once assigned, a discriminant
+WAL record discriminants 0–23 are append-only: once assigned, a discriminant
 is never reused for a different record shape. New record types receive the next
 available discriminant.
+
+#### Discriminant 23 is opt-in, and taking it moves the store to V10
+
+`SetEdgeCount` (23) carries insert-count multiplicity. It is written **only**
+on a store that has called `enable_multiplicity()`. A store that never calls it
+contains no discriminant-23 record, keeps writing V9 snapshots, and stays
+readable by every release from v0.6.0 on — indefinitely, not just until its next
+snapshot. That is the property the whole design rests on.
+
+Opting in cannot be undone, and there is no call that undoes it. Unlike an
+unreadable index blob — which degrades, because the reader falls back to a
+correct exhaustive scan — an unreadable WAL record cannot degrade: the reader
+cannot know what the record would have changed.
+
+Left to itself, an older reader would do something worse than refusing.
+`decode_all` treats any frame it cannot deserialise as a corrupt tail and
+returns the valid prefix, so a pre-v0.6.10 binary replaying such a WAL would
+stop at the first discriminant-23 frame, lose every commit after it, and — with
+`repair_wal`, which is on by default — **write that truncation back to disk**.
+Silent data loss, persisted, at exactly the moment an operator is reaching for a
+downgrade.
+
+**The snapshot version is what prevents it.** mushroomdb's two formats fail in
+opposite directions: an unknown snapshot version is refused by name, an unknown
+WAL discriminant is not. The snapshot is read *before* the WAL, so opting in
+puts the loud failure in front of the silent one:
+
+- `enable_multiplicity()` writes a **V10 snapshot first**, in the same call,
+  before it appends the discriminant-23 declaration. The store is therefore
+  never in a state where the record is on disk without the V10 stamp that
+  guards it — not even across a crash.
+- Every later snapshot the store takes is V10 too, for as long as multiplicity
+  is enabled.
+- A pre-v0.6.10 binary opening that store stops at
+  `snapshot: unsupported version 10` and **leaves the WAL byte-identical**.
+
+So the downgrade path after opting in is a clean, named refusal rather than lost
+commits. It is still one-way: an older binary cannot read the store, and no call
+puts it back. Opt in when you want the feature, not by default.
+
+##### `enable_multiplicity()` is not atomic, and `Err` does not undo it
+
+The ordering above is the property the design rests on. Atomicity is not, and
+the call does not have it. A failed `enable_multiplicity()` reports `Err` and
+leaves that handle reporting `is_multiplicity_enabled() == false`, but the store
+can still be opted in — immediately, or from its next open:
+
+- The declaration is appended to `wal.bin` and *then* fsynced. A failed barrier
+  leaves the record on disk; the next open replays it and the store is opted in.
+- If the declaration never landed but the V10 snapshot did, and the store
+  already had a WAL archive, the open-time recovery for a WAL renamed away
+  mid-archive treats a V10 stamp beside an archive as an interrupted opt-in and
+  opts the store in.
+
+Neither costs a reader anything, and that is the point: the V10 stamp is written
+first, so every reachable intermediate state is one an older binary refuses by
+name. The failure direction spends a refusal, never a commit. What it does mean
+is that **`Err` from this call means "outcome unknown", not "nothing happened"**.
+Reopen the store and ask `is_multiplicity_enabled()`.
+
+One case does leave the store opted out: a failure with no archive present and
+no record written. A stray V10 snapshot remains, and that store's next snapshot
+rewrites it at V9.
 
 Which `Intern` records a `Batch` frame carries, and where they sit inside it,
 is **not** part of the format contract — only that replaying a frame's records
@@ -176,6 +251,10 @@ re-snapshot before upgrading.
    committed before the new snapshot was attempted) and the error is returned —
    log-and-continue is never used.
 4. The next clean open at the current VERSION deletes the `.bak`.
+
+A V10 (multiplicity-enabled) snapshot is **not** migrated: it is at or above the
+version this binary writes, so it is treated as current and left alone. Steps 1
+and 2 would only rewrite it as another V10 snapshot.
 
 > **Production note — ANN index re-fit cost.** Stores with approximate
 > (`approximate: true`) rules must re-fit k-means ANN indexes during migration

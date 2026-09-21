@@ -1009,7 +1009,7 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "0.6.9"}
+    "serverInfo": {"name": "mushroomdb", "version": "0.6.10"}
   }
 }
 ```
@@ -1029,8 +1029,8 @@ Seventeen tools:
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
 | `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused). An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. |
-| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?` (default **0.8**), `where?`, `exact?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; `exact` true skips HNSW. Edge-traversal mode ignores both. Vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist. HTTP `POST /find_similar` is vector-only and defaults `min` to **0.0**. |
-| `pairwise_similar` | Exact cosine top-k among `keys` on `field`; params: `keys`, `field`, `k?` (default 10), `min?` (default 0.0). Self excluded. Never HNSW. |
+| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?` (default **0.8**), `where?`, `exact?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; `exact` true skips HNSW. Edge-traversal mode ignores both. **A `mask` alone is the approximate path**: vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist, and it is still not guaranteed to have found the true top `k` — for an exhaustive answer over the same visible set pass `exact` or a `where`. `where` uses the property index only when `label` accompanies it and `(label, where.field)` is index-enabled; without a label it is a correct-but-slower scan. HTTP `POST /find_similar` is vector-only and defaults `min` to **0.0**. |
+| `pairwise_similar` | Exact cosine top-k among `keys` on `field`; params: `keys`, `field`, `k?` (default 10), `min?` (default 0.0). Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. Self excluded. Never HNSW. |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
 | `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits, horizon}` |
@@ -1301,10 +1301,45 @@ default is unchanged.
 **Exact vs approximate.** When no approximate `VectorSimilar` rule covers
 `field`, brute `find_similar` is an exact GEMM. HNSW is still the approximate
 path — used when such a rule covers the field and `exact` is false.
-`exact=True` forces GEMM and does not consult HNSW. A `where=` predicate also
-implies exact. Brute results sort similarity descending, then key ascending;
-the HNSW sort is unchanged. A candidate whose embedding is missing, zero-norm,
-or a different length than the query is skipped. A zero-norm query returns `[]`.
+
+Two arguments make the call exact, and one does not:
+
+| Argument | Kernel | Exact? |
+|---|---|---|
+| `exact=True` | GEMM over the candidate set | **Yes** |
+| `where={…}` | GEMM over the candidate set | **Yes** — a predicate implies exact |
+| `mask=[…]` alone | HNSW, with the beam widened | **No** |
+| a `scoped()` handle alone | HNSW, with the beam widened | **No** |
+
+**`mask=` alone is the approximate path.** This is the one that gets misread. A
+mask narrows *which nodes may be returned*; it does not change *which kernel
+runs*. Under a mask (or a `scoped()` handle) the HNSW beam widens until it has
+`k` visible hits, and only if the beam reaches the cap an exact `VectorSimilar`
+rule uses (`EF_MAX` = 4,096) does it fall back to an exhaustive masked scan. So
+a masked call does not return fewer than `k` while more visible hits exist, and
+it is still not guaranteed to have found the true top `k`.
+
+If you need an exhaustive answer over the visible set, say so — pass
+`exact=True`, or a `where=` predicate. Both keep the mask and the scope; they
+change only the kernel.
+
+```python
+hits = db.find_similar("embedding", query_vec, mask=visible)               # approximate
+hits = db.find_similar("embedding", query_vec, mask=visible, exact=True)   # exact
+```
+
+The engine says this out loud too: the first masked non-exact search of a given
+`(field, label)` on an indexed field prints one line to stderr naming the
+remedy, and further searches of that shape on that index are silent.
+
+Making a mask or a scope imply `exact` was considered and rejected: it would
+silently turn a fast approximate call into an O(n) GEMM for every existing
+masked caller.
+
+`exact=True` forces GEMM and does not consult HNSW. Brute results sort
+similarity descending, then key ascending; the HNSW sort is unchanged. A
+candidate whose embedding is missing, zero-norm, or a different length than the
+query is skipped. A zero-norm query returns `[]`.
 
 ```python
 hits = db.find_similar("embedding", query_vec, exact=True)
@@ -1325,11 +1360,38 @@ the engine.
 ```
 
 Candidates are `label ∩ mask ∩ where`. `mask` is still a list of keys; it
-intersects, never widens. `label` restricts as before. If `label` is set and
-`enable_index(label, where.field)` is on, `eq` / `in` use the property index;
-otherwise the labelled (or live) set is scanned. `where` is a query argument,
-not a role definition — see [masks.md](masks.md#narrowing-a-role-by-a-property)
-for the role-side predicate.
+intersects, never widens. `label` restricts as before.
+
+**`where=` uses the property index only when a `label` accompanies it.** The
+index is keyed on `(label, field)`, so a predicate with no label has nothing to
+look up. Both conditions must hold for the index path:
+
+1. `label=` is set on the call, **and**
+2. `enable_index(label, where["field"])` has been called on the store.
+
+With both, `eq` / `in` resolve through the property index. With either missing —
+a predicate and no label, or a label whose `(label, field)` index was never
+enabled — the call scans the labelled set, or the whole live set when there is
+no label. **That scan is correct, just slower**; the answer is identical either
+way, so nothing tells you at runtime which path you took. If a `where=` search
+is slower than you expected, this is the first thing to check.
+
+```python
+db.enable_index("Document", "status")
+hits = db.find_similar(                      # index path
+    "embedding", query_vec, label="Document",
+    where={"field": "status", "eq": "published"},
+)
+hits = db.find_similar(                      # correct, but a full live scan
+    "embedding", query_vec,
+    where={"field": "status", "eq": "published"},
+)
+```
+
+`where` is a predicate on the **data**, not on the caller — see
+[masks.md](masks.md#scoped-one-front-door-for-visibility) for the difference,
+and [masks.md](masks.md#narrowing-a-role-by-a-property) for the role-side
+predicate, `visible_where`.
 
 `pairwise_similar(keys, field, k=10, min=0.0)` is exact cosine top-k for each
 key in `keys`, scored only against that same set. Self-matches are excluded.
@@ -1346,7 +1408,11 @@ still appears as `(src, [])`, so "present, nothing similar" is distinct from
 "omitted". Unknown keys, missing embeddings, zero-norm and wrong-dimension
 vectors are omitted as both query and candidate. Duplicate keys collapse to
 first-seen order. Empty `keys` returns `[]`. More than 8192 unique resolved
-keys raises. `min` is the same unit and inequality as `find_similar`.
+keys raises. `min` is the same unit and inequality as `find_similar`: cosine
+similarity in `[-1, 1]`, kept when `score >= min`. A distance of `1 - sim` is
+the caller's conversion here too — the engine does not speak distance on this
+surface any more than on `find_similar`. Convert after the call if you need a
+distance cut (`keep if 1 - sim < T`); do not bake `T` into `min`.
 
 ### Degree
 

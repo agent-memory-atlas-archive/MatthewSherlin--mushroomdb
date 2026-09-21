@@ -137,7 +137,7 @@ fn build_epv<'a>(
 fn make_view<'a>(
     state: &'a FrozenOverlay,
     base: &'a Option<Arc<MappedBase>>,
-    mask: Option<&'a HashSet<u32>>,
+    mask: Option<&'a core_query::visible::VisibleSet>,
 ) -> GraphView<'a> {
     GraphView {
         ids: &state.ids,
@@ -352,11 +352,32 @@ fn apply_one(
         // to a correct scan+filter for reader queries.
         | WalRecord::EnableIndex { .. }
         | WalRecord::DisableIndex { .. }
+        // The opt-in declaration is a writer-side gate; the read path never
+        // decides whether to write a record. A *count* is not a no-op and is
+        // handled below.
+        | WalRecord::SetEdgeCount { count: 0, .. }
         // History markers are no-ops in the read path. Rules re-derive their
         // edges when the ReaderSnapshot queries the live engine; markers only
         // serve edge_history / was_linked WAL scans.
         | WalRecord::DerivedEdgeAdded { .. }
         | WalRecord::DerivedEdgeRetracted { .. } => {}
+
+        // An insert count is an edge property, so the read path carries it the
+        // way it carries any other: absolute, last write wins.
+        WalRecord::SetEdgeCount {
+            etype,
+            src,
+            dst,
+            count,
+        } => {
+            edge_props.set(
+                *etype,
+                *src,
+                *dst,
+                crate::db::EDGE_COUNT_PROP,
+                core_storage::Value::Int(*count as i64),
+            );
+        }
 
         WalRecord::RenameNode { old_key, new_key } => {
             // Recovery-safe: if old_key is already gone (frozen overlay or a
@@ -650,6 +671,63 @@ impl ReaderSnapshot {
             dir,
             mask,
         )
+    }
+
+    /// Every edge incident on `key` that the scope may see.
+    ///
+    /// The snapshot twin of [`GraphDb::node_edges_scoped`](crate::GraphDb::node_edges_scoped),
+    /// and the contract HTTP's role-token branch used to write by hand: the
+    /// subject is checked first, so a hidden key answers exactly as an absent
+    /// one does, and then every edge whose *other* endpoint is hidden is
+    /// dropped — a visible node must not become a window onto its hidden
+    /// neighbours.
+    ///
+    /// `derived` is always `false`, as it is on [`Self::node_edges`]: a snapshot
+    /// carries no rule engine.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
+    pub fn node_edges_scoped(&self, key: &str, mask: &NodeMask) -> Result<Vec<EdgeInfo>> {
+        let state = self.effective()?;
+        if !state.ids.get(key).is_some_and(|id| mask.contains_id(id)) {
+            return Err(GraphError::KeyNotFound { key: key.into() });
+        }
+        let edges = node_edges_from(key, state, &self.base)?;
+        Ok(edges
+            .into_iter()
+            .filter(|e| {
+                let other = if e.src_key == key {
+                    &e.dst_key
+                } else {
+                    &e.src_key
+                };
+                state.ids.get(other).is_some_and(|id| mask.contains_id(id))
+            })
+            .collect())
+    }
+
+    /// BFS expansion from `key`, with the subject check
+    /// [`Self::neighborhood_masked`] deliberately omits.
+    ///
+    /// The snapshot twin of [`GraphDb::neighborhood_scoped`](crate::GraphDb::neighborhood_scoped).
+    /// Expansion is unchanged — hidden nodes are neither returned nor traversed
+    /// through — so a visible node reachable only through a hidden one stays
+    /// out.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
+    pub fn neighborhood_scoped(
+        &self,
+        key: &str,
+        depth: u32,
+        edge_types: Option<&[&str]>,
+        dir: Dir,
+        mask: &NodeMask,
+    ) -> Result<ResultSet> {
+        let state = self.effective()?;
+        if !state.ids.get(key).is_some_and(|id| mask.contains_id(id)) {
+            return Err(GraphError::KeyNotFound { key: key.into() });
+        }
+        neighborhood_masked_from(key, state, &self.base, depth, edge_types, dir, mask)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })
     }
 }
 

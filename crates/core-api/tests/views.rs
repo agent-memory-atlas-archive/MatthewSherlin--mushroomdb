@@ -14,7 +14,7 @@
 /// - Snapshot+WAL round-trip preserves views
 /// - DST oracle: quiescent value == scratch recompute
 use core_api::{
-    AggFn, Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource,
+    AggFn, BatchOp, Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource,
 };
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -762,4 +762,110 @@ fn pending_deltas_are_clean_through_view_heavy_workload() {
         db.delete_node(&format!("p{i}")).unwrap();
     }
     assert_eq!(db.get_prop("o1", "headcount"), Some(Value::Int(0)));
+}
+
+// ---------------------------------------------------------------------------
+// Defect #19 — creation is a write to a view-owned property too
+// ---------------------------------------------------------------------------
+
+/// A node may not be *created* carrying a property a view owns.
+///
+/// Before this guard, `insert_node` consulted only the key, so creation was the
+/// one write that reached a view-owned field unchallenged — while `set_prop`,
+/// `set_props`, `remove_prop` and `BatchOp::RemoveProp` all refuse it.
+///
+/// It was not a harmless redundancy. A node created with a view-owned value and
+/// no subsequent view event keeps the caller's value for the life of the
+/// handle, and the backfill at the next open replaces it: the store answers
+/// one thing before a restart and another after, for a property the API calls
+/// read-only. This test's fixture is that divergence, frozen as a refusal.
+#[test]
+fn insert_node_refuses_a_view_owned_prop() {
+    let dir = tmp("insert-viewprop");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(degree_view(
+        "links_out",
+        "Doc",
+        "deg",
+        "LINK",
+        Direction::Out,
+    ))
+    .unwrap();
+
+    let err = db
+        .insert_node("Doc", "a", vec![("deg".into(), Value::Int(999))])
+        .unwrap_err();
+    assert!(
+        matches!(&err, GraphError::ViewPropReadOnly { view_name } if view_name == "links_out"),
+        "{err:?}"
+    );
+    assert!(!db.has_node("a"), "the refused insert wrote nothing");
+
+    // The same node without the view-owned field is ordinary.
+    db.insert_node("Doc", "a", vec![("title".into(), Value::Str("one".into()))])
+        .unwrap();
+    assert_eq!(db.get_prop("a", "deg"), Some(Value::Int(0)));
+}
+
+/// The refusal is checked before the key, as it is for `remove_prop`, so the
+/// answer does not depend on whether the key exists.
+#[test]
+fn insert_node_refuses_a_view_owned_prop_before_reporting_a_duplicate_key() {
+    let dir = tmp("insert-viewprop-dup");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(degree_view(
+        "links_out",
+        "Doc",
+        "deg",
+        "LINK",
+        Direction::Out,
+    ))
+    .unwrap();
+    db.insert_node("Doc", "a", vec![]).unwrap();
+
+    let err = db
+        .insert_node("Doc", "a", vec![("deg".into(), Value::Int(999))])
+        .unwrap_err();
+    assert!(
+        matches!(&err, GraphError::ViewPropReadOnly { .. }),
+        "the view-owned field is the answer, not DuplicateKey: {err:?}"
+    );
+}
+
+/// `BatchOp::InsertNode` is the path the HTTP and CLI writers submit, and it
+/// went through the same unguarded check. It refuses the whole frame, which is
+/// what every other view-owned refusal in a batch already does.
+#[test]
+fn batch_insert_node_refuses_a_view_owned_prop() {
+    let dir = tmp("batch-insert-viewprop");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(degree_view(
+        "links_out",
+        "Doc",
+        "deg",
+        "LINK",
+        Direction::Out,
+    ))
+    .unwrap();
+
+    let (results, sync_err) = db.commit_group(vec![vec![
+        BatchOp::InsertNode {
+            label: "Doc".into(),
+            key: "a".into(),
+            props: vec![("deg".into(), Value::Int(999))],
+        },
+        BatchOp::InsertNode {
+            label: "Doc".into(),
+            key: "b".into(),
+            props: vec![],
+        },
+    ]]);
+    assert!(sync_err.is_none(), "{sync_err:?}");
+    let err = results.into_iter().next().unwrap().unwrap_err();
+    assert!(
+        matches!(&err, GraphError::ViewPropReadOnly { view_name } if view_name == "links_out"),
+        "{err:?}"
+    );
+    assert!(!db.has_node("a"));
+    assert!(!db.has_node("b"), "the frame is atomic");
 }

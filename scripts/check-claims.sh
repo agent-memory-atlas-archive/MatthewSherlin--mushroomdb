@@ -94,6 +94,35 @@ scan_grep_files() {
 scan_claim_files
 scan_grep_files
 
+# The stub-docstring drift check. Separate script, one gate: a caller reading a
+# thinner contract than the binding carries is the same class of defect as a
+# retired claim, and CI already runs this one script.
+if ! bash "$ROOT/scripts/check-pyi.sh"; then
+  fail=1
+fi
+
+# Install pins that name a version. `llms.txt` carries a copy-pasteable Claude
+# Desktop config; it was bumped in every release commit through 0.6.8, then
+# silently skipped by 0.6.9's and 0.6.10's, so 0.6.9 shipped telling readers to
+# install 0.6.8. `llms-full.txt` and the plugin files are generated and cannot
+# drift, but the hand-maintained ones can, and nothing was watching them.
+WORKSPACE_VERSION="$(awk -F'"' '/^version = "/{print $2; exit}' "$ROOT/Cargo.toml")"
+if [[ -n "$WORKSPACE_VERSION" ]]; then
+  # A complete version only. `mushroomdb@0.6.x` is a deliberate *series*
+  # reference in the deprecation table, not a pin anyone copy-pastes.
+  stale="$(grep -rnE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" \
+             --include='*.md' --include='*.txt' --include='*.json' --include='*.sh' \
+             "$ROOT" 2>/dev/null \
+           | grep -v "mushroomdb@${WORKSPACE_VERSION}" \
+           | grep -vE "/(target|target-[^/]*)/|/CHANGELOG\.md:|/docs/roadmap/" || true)"
+  if [[ -n "$stale" ]]; then
+    echo "check-claims.sh: install pins naming a version other than ${WORKSPACE_VERSION}:" >&2
+    printf '%s\n' "$stale" >&2
+    echo "  (a reader copy-pastes these; the historical CHANGELOG and docs/roadmap are exempt)" >&2
+    fail=1
+  fi
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "check-claims.sh: FAILED — see the lines above" >&2
   exit 1

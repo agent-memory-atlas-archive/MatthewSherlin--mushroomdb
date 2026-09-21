@@ -5,9 +5,9 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use core_api::{
-    json_to_value, schema::Schema, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary,
-    RoleDef, RuleDef, RuleStats, SharedDb, SnapshotOptions, Stats, Value, WriteScope,
-    MERGE_CREATE_NEEDS_ONE_NAMESPACE,
+    json_to_value, schema::Schema, Direction, Explanation, FkSkip, IngestReport, Predicate,
+    PredicateSummary, RoleDef, RuleDef, RuleStats, SharedDb, SnapshotOptions, Stats, Value,
+    ViewDef, ViewSource, WriteScope, MERGE_CREATE_NEEDS_ONE_NAMESPACE,
 };
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
@@ -2193,6 +2193,131 @@ async fn role_token_neighborhood_hidden_key_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+// ── 21. A corrupt overlay is reported as corruption, never as a missing key ──
+//
+// v0.6.10 defect ledger #5. Both role branches read through a `ReaderSnapshot`,
+// whose `effective()` answers `Corrupt` when the delta tail will not fold into
+// the frozen overlay. No test exercised that state on these two routes, which
+// is why Task 2's rewrite changed the answer unnoticed: the old branches
+// reached the same error through `resolve_key` / `neighborhood_masked`, which
+// swallow it with `.ok()?` and answer **404 key not found**.
+//
+// The kept behaviour is the one these tests pin: a damaged store says it is
+// damaged. A 404 tells a caller the key is not there — they retry, or give up
+// on the key, and never learn the store needs attention.
+
+/// The role mask is resolved from the same effective state, so on a cold memo
+/// the corruption surfaces at `mask_for_role` — before either scoped read is
+/// reached. That is the ledger's reproduction meeting the code: on these two
+/// routes the divergence it describes needs a **warm** memo (the next test).
+#[tokio::test]
+async fn a_corrupt_overlay_is_reported_before_the_role_mask_resolves() {
+    let (app, db) = open_rbac(
+        "rbac-corrupt-cold",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    {
+        let mut w = db.write();
+        w.insert_node("Pub", "pub1", vec![]).unwrap();
+        w.insert_node("Pub", "pub2", vec![]).unwrap();
+        w.insert_edge("KNOWS", "pub1", "pub2").unwrap();
+        w.push_unapplyable_delta_for_test();
+    }
+
+    for uri in ["/node/pub1/edges", "/node/pub1/neighborhood"] {
+        let (status, body, _) = send(app.clone(), authed_get(uri, "role-tok")).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{uri} must not answer 404 for a store it cannot read"
+        );
+        let err = parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            err.contains("mvcc delta intern mismatch"),
+            "{uri} must name the corruption: {err}"
+        );
+        assert!(
+            !err.contains("key not found"),
+            "{uri} must not blame the key: {err}"
+        );
+    }
+}
+
+/// With the role mask already memoised at this `commit_seq`, `mask_for_role`
+/// answers from the memo and the scoped read is the first call to touch the
+/// tail. This is the exact state defect #5 describes: the old branches answered
+/// **404**, the `*_scoped` methods propagate the `Corrupt`.
+///
+/// The status is the one `graph_err` gives `Corrupt` today — 400, not 5xx as
+/// the ledger assumed. The assertion that matters, and the reason the new
+/// behaviour was kept, is the one below it: the body names the damage.
+#[tokio::test]
+async fn a_corrupt_overlay_under_a_warm_role_mask_is_not_a_404() {
+    let (app, db) = open_rbac(
+        "rbac-corrupt-warm",
+        &[("analyst", &["Pub"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    {
+        let mut w = db.write();
+        w.insert_node("Pub", "pub1", vec![]).unwrap();
+        w.insert_node("Pub", "pub2", vec![]).unwrap();
+        w.insert_edge("KNOWS", "pub1", "pub2").unwrap();
+    }
+
+    // Warm the `(role, commit_seq)` memo on a store that is still readable.
+    for uri in ["/node/pub1/edges", "/node/pub1/neighborhood"] {
+        let (status, _, _) = send(app.clone(), authed_get(uri, "role-tok")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri} must answer before the damage"
+        );
+    }
+
+    // The tail breaks without a commit, so the memo stays valid: the mask
+    // resolves, and `node_edges_scoped` / `neighborhood_scoped` are what hit
+    // the unfoldable tail.
+    db.write().push_unapplyable_delta_for_test();
+
+    for uri in ["/node/pub1/edges", "/node/pub1/neighborhood"] {
+        let (status, body, _) = send(app.clone(), authed_get(uri, "role-tok")).await;
+        let err = parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{uri} answered 404 for a corrupt store — the pre-Task-2 behaviour: {err}"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {err}");
+        assert!(
+            err.contains("mvcc delta intern mismatch"),
+            "{uri} must name the corruption: {err}"
+        );
+        assert!(
+            !err.contains("key not found"),
+            "{uri} must not blame the key: {err}"
+        );
+    }
+
+    // A full token reads the same damaged store through the unscoped path —
+    // pinned here so the role branches' answer can be read against it.
+    let (status, _, _) = send(app, authed_get("/node/pub1/edges", "admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the full-token path does not read the delta tail"
+    );
+}
+
 // ── Fix round-1: C1 — /edges filters hidden neighbor endpoints ────────────────
 
 #[tokio::test]
@@ -4176,6 +4301,118 @@ async fn scoped_remove_ns_prop_refused() {
         db.read().namespace_of("n1").as_deref(),
         Some("tenant-a"),
         "the node keeps its namespace"
+    );
+}
+
+/// Build a store whose `AgentNote` nodes carry a view-owned `deg` property.
+///
+/// `n1 -RECALLS-> n2`, so the view backfills `deg = 1` onto `n1` — a stored
+/// property no caller may write or remove.
+fn open_view_prop_db(name: &str, full_token: Option<&str>) -> (Router, SharedDb) {
+    let (app, db) = open_rbac_write(
+        name,
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        full_token,
+        &[("role-tok", "agent")],
+    );
+    {
+        let mut w = db.write();
+        w.create_view(ViewDef {
+            name: "recalls_out".into(),
+            label: "AgentNote".into(),
+            view_prop: "deg".into(),
+            source: ViewSource::Degree {
+                edge_type: "RECALLS".into(),
+                direction: Direction::Out,
+            },
+        })
+        .unwrap();
+        w.insert_node("AgentNote", "n1", vec![("x".into(), Value::Int(1))])
+            .unwrap();
+        w.insert_node("AgentNote", "n2", vec![]).unwrap();
+        w.insert_edge("RECALLS", "n1", "n2").unwrap();
+        assert_eq!(
+            w.get_prop("n1", "deg"),
+            Some(Value::Int(1)),
+            "fixture: the view backfilled a stored property onto n1"
+        );
+    }
+    (app, db)
+}
+
+/// `DELETE /node/{key}/prop/{field}` must not delete a property a view owns.
+///
+/// Same shape as `scoped_remove_ns_prop_refused`: the route reaches
+/// `BatchOp::RemoveProp`, which never meets `GraphDb::remove_prop`'s
+/// `ViewPropReadOnly` guard, so the refusal has to hold at the batch
+/// choke-point — and it has to hold over HTTP, on the role-token branch a
+/// role with update rights can reach.
+#[tokio::test]
+async fn scoped_remove_view_owned_prop_refused() {
+    let (app, db) = open_view_prop_db("t3-rp-view-role", Some("admin"));
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/deg", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "removing a view-owned property must be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    let msg = v["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("managed by view") && msg.contains("recalls_out"),
+        "body must name the owning view: {v}"
+    );
+    assert_eq!(
+        db.read().get_prop("n1", "deg"),
+        Some(Value::Int(1)),
+        "the view-owned property survives the request"
+    );
+}
+
+/// The full-identity branch of the same route submits its own
+/// `BatchOp::RemoveProp`. A guard on only the role branch would leave this one
+/// open, so it is pinned separately.
+#[tokio::test]
+async fn full_token_remove_view_owned_prop_refused() {
+    let (app, db) = open_view_prop_db("t3-rp-view-full", Some("admin"));
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/deg", "admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "removing a view-owned property must be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    let msg = v["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("managed by view") && msg.contains("recalls_out"),
+        "body must name the owning view: {v}"
+    );
+    assert_eq!(
+        db.read().get_prop("n1", "deg"),
+        Some(Value::Int(1)),
+        "the view-owned property survives the request"
+    );
+}
+
+/// The refusal is about the view-owned field, not about the route: an ordinary
+/// property on the same node still deletes over the same endpoint.
+#[tokio::test]
+async fn remove_ordinary_prop_still_works_beside_a_view() {
+    let (app, db) = open_view_prop_db("t3-rp-view-other", Some("admin"));
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/x", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a non-view property still deletes: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(db.read().get_prop("n1", "x"), None, "the property is gone");
+    assert_eq!(
+        db.read().get_prop("n1", "deg"),
+        Some(Value::Int(1)),
+        "and the view-owned one is untouched"
     );
 }
 

@@ -34,6 +34,14 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// open-time pass over a store with no `ns` column fills `node_ns` with one
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
+
+/// The reserved edge property holding a pair's insert count (§5.13).
+///
+/// Absent means 1 — the count is written only from the second insert of a
+/// triple onward, and only on a store that called
+/// [`GraphDb::enable_multiplicity`]. The engine owns the name: Cypher `SET` on
+/// it is refused, as the other reserved names are.
+pub const EDGE_COUNT_PROP: &str = "count";
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -99,6 +107,96 @@ pub fn query_sub_exec_count() -> usize {
 #[doc(hidden)]
 pub fn reset_query_sub_exec_count() {
     QUERY_SUB_EXECS_TL.with(|c| c.set(0));
+}
+
+// Exact-versus-approximate warnings emitted on this thread. Thread-local for
+// the same reason [`QUERY_SUB_EXECS_TL`] is: integration tests run in parallel
+// and each gets its own thread, so a neighbour's masked search cannot be
+// mistaken for this test's.
+thread_local! {
+    static AMBIGUOUS_EXACTNESS_WARNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static AMBIGUOUS_EXACTNESS_LAST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// How many times a masked, non-exact vector search has explained itself on
+/// this thread since the last [`ambiguous_exactness_warns_reset`].
+///
+/// The line itself is the product; this counter exists so a test can assert it
+/// is printed **once per index** rather than once per call.
+///
+/// **Single-threaded assertions only.** The suppression set this counts is a
+/// `Mutex<HashSet<_>>` on the `GraphDb` — shared by every thread — while the
+/// counter is thread-local. Under a concurrent caller (`serve`, which is the
+/// deployment the warning exists for) the thread that prints the line is not
+/// necessarily the thread that asked, so a zero here does not mean the line was
+/// not printed and a one does not mean it was printed once. It answers
+/// "once per index" only in a test that owns the store.
+#[doc(hidden)]
+pub fn ambiguous_exactness_warns() -> u64 {
+    AMBIGUOUS_EXACTNESS_WARNS.with(|c| c.get())
+}
+
+/// The most recent exactness warning printed on this thread, verbatim.
+///
+/// The advice a caller reads has to be advice that caller can act on, which the
+/// counter alone cannot witness — see
+/// `the_hybrid_path_advises_a_call_the_hybrid_caller_can_make`. Carries the
+/// same single-threaded caveat as [`ambiguous_exactness_warns`].
+#[doc(hidden)]
+pub fn ambiguous_exactness_last_warning() -> Option<String> {
+    AMBIGUOUS_EXACTNESS_LAST.with(|c| c.borrow().clone())
+}
+
+/// Reset this thread's exactness-warning counter and recorded line.
+#[doc(hidden)]
+pub fn ambiguous_exactness_warns_reset() {
+    AMBIGUOUS_EXACTNESS_WARNS.with(|c| c.set(0));
+    AMBIGUOUS_EXACTNESS_LAST.with(|c| *c.borrow_mut() = None);
+}
+
+/// Which signature reached the approximate masked vector leg.
+///
+/// One code path, two entry points, and the advice cannot be the same: a
+/// warning that names an argument the caller's function does not take sends
+/// them looking for a parameter that is not there. `search_hybrid` and
+/// `search_hybrid_scoped` take `(text_field, query_text, vector_field,
+/// query_vec, label, k[, mask])` — no `exact`, no `where`.
+///
+/// The warning is not suppressed on the hybrid path. The approximation is the
+/// same one, and a caller who read `mask=` as a promise of exhaustiveness is
+/// the reader it was written for whichever door they came in by; only the
+/// remedy differs, so only the remedy changes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ExactnessCaller {
+    /// `find_similar` / `find_similar_vector_*` — `exact` and `where` are its
+    /// own parameters.
+    Vector,
+    /// `search_hybrid` / `search_hybrid_scoped` — neither argument exists, and
+    /// the leg is one half of a fusion.
+    Hybrid,
+}
+
+impl ExactnessCaller {
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Vector => "a masked vector search",
+            Self::Hybrid => "the vector leg of a masked hybrid search",
+        }
+    }
+
+    fn advice(self) -> &'static str {
+        match self {
+            Self::Vector => "pass exact=True or a where= predicate.",
+            // Names the call that does take the argument, because this one
+            // does not: the caller's own next step, not a parameter hunt.
+            Self::Hybrid => {
+                "run the vector leg on its own with find_similar(field, vector, mask=…, \
+                 exact=True) and fuse it with search() yourself — search_hybrid itself \
+                 takes no exactness argument."
+            }
+        }
+    }
 }
 
 /// Internal state for a single `subscribe_query` subscription.
@@ -264,6 +362,9 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         // state and rules re-derive deterministically on replay.
         | WalRecord::DerivedEdgeAdded { .. }
         | WalRecord::DerivedEdgeRetracted { .. }
+        // A count changes neither the node nor the edge population: the pair it
+        // counts was already there, which is why it is written at all.
+        | WalRecord::SetEdgeCount { .. }
         // RenameNode carries no node/edge count change; no special event.
         | WalRecord::RenameNode { .. } => None,
     }
@@ -1433,6 +1534,14 @@ pub struct GraphDb<F: Fs> {
     /// Rebuild-on-open: declarations replay from the WAL, postings rebuild at
     /// open end (mirrors `fulltext`).
     prop_index: PropertyIndex,
+    /// Whether this store records insert-count multiplicity (§5.13).
+    ///
+    /// Declared like `prop_index`'s enabled pairs — a WAL record replayed at
+    /// open, re-emitted into the baseline by a truncating snapshot — but it
+    /// gates a *format* step rather than an index: `WalRecord::SetEdgeCount`
+    /// (discriminant 23) is written only when this is `true`, so a store that
+    /// never opts in stays readable by a binary that predates the record.
+    multiplicity: bool,
     event_sink: Option<Box<dyn Fn(MutationEvent) + Send + Sync>>,
     /// WAL fsync cadence. Default [`FsyncPolicy::Strict`].
     fsync: FsyncPolicy,
@@ -1454,6 +1563,15 @@ pub struct GraphDb<F: Fs> {
     /// definitions change or the store is reloaded, which `commit_seq` does not
     /// record; see [`RoleMaskCache`](crate::mask::RoleMaskCache).
     role_masks: Arc<crate::mask::RoleMaskCache>,
+    /// Which loaded store this handle is, for memos that outlive it.
+    ///
+    /// `role_masks` needs no such thing — the handle owns it and replaces it —
+    /// but a [`Scope`](crate::mask::Scope) is the caller's, so its resolved key
+    /// leg is stamped with this alongside `commit_seq`. Minted fresh here and
+    /// again in [`reset_for_reload`](GraphDb::reset_for_reload), at exactly the
+    /// two points a fresh `RoleMaskCache` is installed; see
+    /// [`StoreStamp`](crate::mask::StoreStamp) for the invariant.
+    store_id: crate::mask::StoreId,
     /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
     /// distribute_events call.
     subscriptions: Vec<SubEntry>,
@@ -1531,6 +1649,20 @@ pub struct GraphDb<F: Fs> {
     ///
     /// Persisted via the `wal.genesis` marker file; loaded from it at open.
     archive_genesis_chain: bool,
+    /// True when this handle can *prove* the live WAL has never been truncated:
+    /// there was no `snapshot.bin` when it opened the store, and it has taken no
+    /// truncating snapshot since.
+    ///
+    /// The archive path's genesis check asks "did a snapshot exist before this
+    /// one?" as a proxy for "was the WAL ever truncated". The proxy is sound
+    /// across sessions — this binary cannot tell a history-preserving snapshot
+    /// from a truncating one once the handle that took it is gone — but inside
+    /// one session it is not, and `enable_multiplicity` made that visible: its
+    /// forced `keep_wal` snapshot left the WAL entirely intact and yet
+    /// permanently disqualified the store from ever receiving a genesis marker
+    /// (defect #23). This flag is what the proxy defers to when the answer is
+    /// actually known.
+    snapshot_preserved_history: bool,
     /// Transient write-authz context set by `write_batch_authz` /
     /// `query_write_authz` for the duration of ONE mutation call.
     /// Always `None` at rest.  Never serialized, never WAL-replayed.
@@ -1543,6 +1675,15 @@ pub struct GraphDb<F: Fs> {
     /// Ring buffer of recent slow queries (interior-mutable so `query(&self)`
     /// can record entries without requiring `&mut self`).
     slow_queries: std::sync::Mutex<SlowQueryLog>,
+    /// `(field, label, caller)` triples whose exact-versus-approximate
+    /// ambiguity this handle has already explained once. See
+    /// [`note_ambiguous_exactness`](GraphDb::note_ambiguous_exactness).
+    /// The caller shape is part of the key because the two shapes give
+    /// different advice — silencing one with the other would leave a caller
+    /// reading advice meant for a signature it does not have.
+    /// Advice bookkeeping, not graph state: a reload keeps it, as the
+    /// slow-query log does.
+    warned_ambiguous_exactness: std::sync::Mutex<HashSet<(String, String, ExactnessCaller)>>,
     /// Instant at which the database was opened (used by `/metrics` uptime).
     started_at: std::time::Instant,
     // ── Multi-process state (cross-process lock + WAL tailing) ────────────────
@@ -1679,6 +1820,17 @@ pub struct WriteAuthz {
     /// Resolved by `mask_for_role` under the same write guard as the mutation.
     /// Always `Omit`-mode — never `Stub`.
     pub mask: crate::mask::NodeMask,
+}
+
+/// The error every role surface gives when `roles.json` did not parse at open.
+///
+/// One text, so `mask_for_role` and [`GraphDb::roles_checked`] cannot drift
+/// apart on the same cause.
+fn roles_poisoned() -> GraphError {
+    GraphError::Corrupt {
+        detail: "roles.json was corrupt at open; fix the file and re-open to restore role access"
+            .into(),
+    }
 }
 
 /// Write `bytes` to `snapshot.bin.bak` atomically with full fsync.
@@ -1995,6 +2147,45 @@ impl GraphDb<RealFs> {
         temporal.query_masked(cypher, params, &mask)
     }
 
+    /// Run a **read-only** Cypher query at `commit`, restricted by a
+    /// [`Scope`](crate::mask::Scope).
+    ///
+    /// [`AsOfScope`] names *one* restriction — a role, a key list, a namespace,
+    /// or a role-and-keys pair. A `Scope` is the general shape a handle carries,
+    /// and nesting can give it several role or namespace legs at once, so it
+    /// cannot be spelled as an `AsOfScope`. This is the entry point a scoped
+    /// handle uses for time travel; `query_at_scoped` stays the way to ask for
+    /// one named restriction.
+    ///
+    /// Both the graph and the scope's key and namespace legs are resolved
+    /// against `commit`; a role's *definition* is the current one, because
+    /// `roles.json` is a sidecar with no past version — the same split
+    /// [`GraphDb::query_at_scoped`] documents.
+    ///
+    /// The scope resolves **cold** here: a temporal handle is its own store, so
+    /// its ids could never be served to a live read, but filling the scope's
+    /// one-entry key memo from a handle thrown away at the end of this call
+    /// would evict the live entry for nothing. See
+    /// [`Scope::resolve_uncached`](crate::mask::Scope::resolve_uncached).
+    ///
+    /// # Errors
+    /// - [`GraphError::CommitOutOfRange`] if `commit` is outside the retained
+    ///   range; the error carries that range.
+    /// - [`GraphError::KeyNotFound`] with a `role:` prefix for an unknown role,
+    ///   or [`GraphError::Corrupt`] when `roles.json` was corrupt at open.
+    /// - A query error for a malformed or write query.
+    pub fn query_at_with_scope(
+        &self,
+        commit: u64,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+        scope: &crate::mask::Scope,
+    ) -> Result<ResultSet> {
+        let temporal = self.open_at_for_read(commit, cypher)?;
+        let mask = scope.resolve_uncached(&temporal)?;
+        temporal.query_masked(cypher, params, &mask)
+    }
+
     /// Open the temporal view for a time-travel read and refuse write Cypher.
     ///
     /// Shared by [`GraphDb::query_at`] and [`GraphDb::query_at_scoped`] so both
@@ -2075,11 +2266,13 @@ impl<F: Fs> GraphDb<F> {
             view_store: ViewStore::new(),
             fulltext: FulltextIndex::new(),
             prop_index: PropertyIndex::new(),
+            multiplicity: false,
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             roles: Some(vec![]),
             role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
+            store_id: crate::mask::StoreId::next(),
             subscriptions: Vec::new(),
             query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -2098,6 +2291,8 @@ impl<F: Fs> GraphDb<F> {
             wal_archive_retention: None,
             wal_horizon_floor: 0,
             archive_genesis_chain: false,
+            // Nothing is proven until `load_from_disk` has looked at the store.
+            snapshot_preserved_history: false,
             pending_write_authz: None,
             slow_query_threshold_ms: std::env::var("MUSHROOMDB_SLOW_QUERY_MS")
                 .ok()
@@ -2107,6 +2302,7 @@ impl<F: Fs> GraphDb<F> {
                 entries: std::collections::VecDeque::new(),
                 total: 0,
             }),
+            warned_ambiguous_exactness: std::sync::Mutex::new(HashSet::new()),
             started_at: std::time::Instant::now(),
             wal_consumed: 0,
             snapshot_ident: None,
@@ -2137,12 +2333,21 @@ impl<F: Fs> GraphDb<F> {
         self.view_store = ViewStore::new();
         self.fulltext = FulltextIndex::new();
         self.prop_index = PropertyIndex::new();
+        // Cleared like every other declaration: a reload replays the store's own
+        // WAL, and the opt-in comes back from it or not at all.
+        self.multiplicity = false;
         self.commit_seq = 0;
         self.roles = Some(vec![]);
         // A fresh cache, not a cleared one: any reader snapshot still holding
         // the old `Arc` keeps it to itself, so nothing it memoised against the
         // pre-reload store can be read back through this handle.
         self.role_masks = Arc::new(crate::mask::RoleMaskCache::new());
+        // The same move for memos this handle does not own. `commit_seq` is
+        // zeroed just above and reseeded from `max(last_change)`, which a
+        // delete-only commit leaves where it was — so a reload can land back on
+        // a sequence a caller's `Scope` already cached a mask at. A new id is
+        // what makes that entry stop matching.
+        self.store_id = crate::mask::StoreId::next();
         self.total_wal_commits = 0;
         self.base = None;
         self.fold_overlay = None;
@@ -2154,6 +2359,8 @@ impl<F: Fs> GraphDb<F> {
         self.last_change = HashMap::new();
         self.wal_horizon_floor = 0;
         self.archive_genesis_chain = false;
+        // Re-derived by `load_from_disk` from the store it is about to read.
+        self.snapshot_preserved_history = false;
         self.pending_write_authz = None;
         self.wal_consumed = 0;
         self.snapshot_ident = None;
@@ -2193,13 +2400,28 @@ impl<F: Fs> GraphDb<F> {
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
         // default impl reads all bytes and truncates (still correct).
         let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
-        // V8 and V9 share the mmap-able container; V9 only adds section 12.
+        // V8, V9 and V10 share the mmap-able container; V9 only adds section 12
+        // and V10 adds nothing but its version stamp. A version outside that set
+        // falls through to the full-read path below, where `snapshot::decode`
+        // either handles it (V5–V7) or refuses it by name — which is what stops
+        // an older binary before it reaches the WAL.
         let is_v8 = snap_header.len() >= 6
             && &snap_header[0..4] == b"GDB1"
-            && matches!(
-                u16::from_le_bytes([snap_header[4], snap_header[5]]),
-                core_storage::snapshot::VERSION_8 | core_storage::snapshot::VERSION_9
-            );
+            && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
+                snap_header[4],
+                snap_header[5],
+            ]));
+        // The version this store is stamped with, or `None` when it has never
+        // been snapshotted. Read from the same six bytes, with no second read.
+        let snapshot_version = if snap_header.len() >= 6 && &snap_header[0..4] == b"GDB1" {
+            Some(u16::from_le_bytes([snap_header[4], snap_header[5]]))
+        } else {
+            None
+        };
+        // No snapshot means no snapshot has ever truncated the WAL, so this
+        // handle can prove the history is whole. Once a snapshot exists that
+        // this handle did not take, it cannot: see `snapshot_preserved_history`.
+        db.snapshot_preserved_history = snap_header.is_empty();
         if is_v8 {
             // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
             // No 2.4GB heap Vec is allocated on RealFs.
@@ -2268,6 +2490,64 @@ impl<F: Fs> GraphDb<F> {
             trace_open!("lazy sections loaded (WAL path)", _t0);
         }
         let replayed = db.apply_frames(records)?;
+        // ── The multiplicity declaration, recovered from the stamp ───────────
+        //
+        // The opt-in is re-emitted into every baseline WAL a snapshot writes, so
+        // ordinarily the replay above has already found it. But
+        // `snapshot_with(archive_wal)` renames the live WAL away and writes its
+        // replacement afterwards, and between those two points the store holds
+        // no live declaration at all. A crash there — or a single `Err` from any
+        // call in between — used to opt the store back out on the next open
+        // (defect #22): it would stop counting and write a **V9** snapshot while
+        // the archives still carried discriminant 23, which is the exact state
+        // the V10 stamp exists to prevent.
+        //
+        // The V10 stamp is what carries the conclusion. The archive clause is a
+        // scope restriction, not a second proof — an earlier version of this
+        // comment, and defect #22, claimed otherwise, and defect #33 corrects
+        // it. Taking the two in order:
+        //
+        // **The stamp.** `snapshot_with` stamps the snapshot from
+        // `self.multiplicity` *before* it touches the WAL, and nothing rewrites
+        // a V10 snapshot at V9 while the store believes it is opted in. So a
+        // V10 stamp says this store reached `enable_multiplicity` far enough to
+        // write the snapshot — and, decisively, that every older binary already
+        // refuses this store by name. Opting in here can cost such a reader
+        // nothing it was not already being told.
+        //
+        // **What the archive clause does not prove.** It is *not* evidence that
+        // the archive was taken while the store was opted in. A store can
+        // archive at V9 and opt in afterwards, leaving a V10 snapshot standing
+        // beside an archive whose WAL carries no declaration at all — see
+        // `a_failed_opt_in_beside_an_archive_comes_back_opted_in`. The inference
+        // held in the success case by coincidence, not by construction.
+        //
+        // **What it does buy: scope.** Without it the recovery would also fire
+        // on a store that reached the V10 snapshot write and then failed with no
+        // archive in sight. That store must stay opted out, and can: no WAL was
+        // renamed away, nothing carries discriminant 23, and its next snapshot
+        // rewrites at V9, which puts it back within reach of every older reader.
+        // An archive is the marker for the one state that is not recoverable
+        // that way — a WAL renamed away that may hold the only copy of the
+        // declaration. `no_crash_leaves_discriminant_23_unguarded` pins that
+        // line: it sweeps a workload with no archives at all and refuses a
+        // V10-implies-enabled rule.
+        //
+        // **The invariant, whichever way the clause goes:** the recovery never
+        // opts in a store whose snapshot is not V10. A V9 store has made no
+        // promise to an older reader, so opting it in would start writing
+        // discriminant 23 behind a stamp that does not guard it. Pinned by
+        // `the_recovery_never_opts_in_a_store_whose_snapshot_is_not_v10` and
+        // `the_recovery_does_not_opt_a_store_in_by_itself`.
+        //
+        // What this recovery cannot do is make the opt-in atomic; it is not,
+        // and `enable_multiplicity` says so. See defects #32-#34.
+        if !db.multiplicity
+            && snapshot_version == Some(core_storage::snapshot::VERSION_10)
+            && !db.fs.list_archives()?.is_empty()
+        {
+            db.multiplicity = true;
+        }
         // The cursor sits at the end of the valid prefix, not the end of the
         // file: a torn or still-being-written tail is unconsumed by definition
         // and stays visible to `is_stale` until it decodes.
@@ -3008,10 +3288,10 @@ impl<F: Fs> GraphDb<F> {
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
             let is_v8 = snap_header.len() >= 6
                 && &snap_header[0..4] == b"GDB1"
-                && matches!(
-                    u16::from_le_bytes([snap_header[4], snap_header[5]]),
-                    core_storage::snapshot::VERSION_8 | core_storage::snapshot::VERSION_9
-                );
+                && core_storage::snapshot::is_mmap_container(u16::from_le_bytes([
+                    snap_header[4],
+                    snap_header[5],
+                ]));
             if is_v8 {
                 let state = if let Some(snap_path) = db.fs.snapshot_path() {
                     let mapped = core_storage::v8::MappedBase::map(&snap_path).map_err(|e| {
@@ -3129,6 +3409,44 @@ impl<F: Fs> GraphDb<F> {
             self.commit_seq,
             Arc::clone(&self.role_masks),
         )
+    }
+
+    /// Append a delta the reader cannot apply, so that a corrupt overlay is
+    /// reachable from a test.
+    ///
+    /// Compiled only under `test-hooks`, which the server's dev-dependency on
+    /// this crate turns on. One call permanently corrupts every
+    /// [`ReaderSnapshot`](crate::reader::ReaderSnapshot) taken from the handle,
+    /// so it must not be in the published surface: `#[doc(hidden)]` hides it
+    /// from rustdoc and from nothing else. The feature gate — not
+    /// `#[cfg(test)]` — because its only callers are in `crates/server/tests`,
+    /// a different crate, exactly as `core_rules`'s index counters are.
+    ///
+    /// [`ReaderSnapshot::effective`](crate::reader::ReaderSnapshot) folds the
+    /// delta tail into a clone of the frozen overlay and answers
+    /// [`GraphError::Corrupt`] when a record will not apply. Nothing a caller
+    /// can do produces that state — `apply_one`'s failures are disagreements
+    /// between the tail and the fold it is applied to, which the write path
+    /// cannot create — so the `Corrupt` arm of every scoped reader method was
+    /// reachable only by inspection until this hook existed. An `Intern` record
+    /// claiming an id the frozen interner will not hand back is the smallest
+    /// such disagreement.
+    ///
+    /// Only the tail is touched. This handle's own state is untouched and
+    /// `commit_seq` does not move, so a role mask already memoised at this
+    /// version stays memoised — which is exactly the state in which the HTTP
+    /// role branches reach a scoped read with a corrupt overlay under them.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn push_unapplyable_delta_for_test(&mut self) {
+        self.delta_tail.push(Arc::new(crate::reader::CommitDelta {
+            records: vec![WalRecord::Intern {
+                id: u32::MAX,
+                text: "delta-tail-corruption".into(),
+            }],
+            derived_inserts: Vec::new(),
+            derived_deletes: Vec::new(),
+        }));
     }
 
     /// Total number of WAL commits at the time [`open_at`] was called.
@@ -4163,6 +4481,32 @@ impl<F: Fs> GraphDb<F> {
             WalRecord::DisableIndex { label, field } => {
                 self.prop_index.disable(label, field);
             }
+            // ── insert-count multiplicity (§5.13) ────────────────────────────
+            //
+            // Two shapes, told apart by `count`: the opt-in declaration, and an
+            // absolute count for one triple. Absolute is what makes this
+            // idempotent over a snapshot base — a pre-snapshot frame replayed
+            // over a base that already folded it in lands on the same number
+            // rather than adding to it, which is the failure a delta (or a count
+            // derived from `InsertEdgeId` records) would have.
+            WalRecord::SetEdgeCount {
+                etype,
+                src,
+                dst,
+                count,
+            } => {
+                if rec.is_multiplicity_decl() {
+                    self.multiplicity = true;
+                } else {
+                    self.edge_props.set(
+                        *etype,
+                        *src,
+                        *dst,
+                        EDGE_COUNT_PROP,
+                        Value::Int(*count as i64),
+                    );
+                }
+            }
             // History markers carry no replay state — rules re-derive edges
             // deterministically on open/replay. Skip unconditionally.
             WalRecord::DerivedEdgeAdded { .. } | WalRecord::DerivedEdgeRetracted { .. } => {}
@@ -4210,6 +4554,14 @@ impl<F: Fs> GraphDb<F> {
     /// output are rolled back, so a later successful mutation cannot log an
     /// `Intern` record whose id replay would never reproduce.
     fn rewrite_wal_dense(&mut self, recs: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+        self.rewrite_wal_dense_planned(recs.into_iter().map(PlannedRec::Rec).collect())
+    }
+
+    /// [`rewrite_wal_dense`](Self::rewrite_wal_dense) for a frame that still
+    /// carries [`PlannedRec::DuplicateCount`] entries — the shape a batch
+    /// produces, where a duplicate's count can only be named once this pass has
+    /// assigned the frame's own ids.
+    fn rewrite_wal_dense_planned(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
         let syms_checkpoint = self.syms.len();
         let result = self.rewrite_wal_dense_inner(recs);
         if result.is_err() {
@@ -4218,7 +4570,7 @@ impl<F: Fs> GraphDb<F> {
         result
     }
 
-    fn rewrite_wal_dense_inner(&mut self, recs: Vec<WalRecord>) -> Result<Vec<WalRecord>> {
+    fn rewrite_wal_dense_inner(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
         let mut out = Vec::with_capacity(recs.len());
         // Node ids allocated by later apply(InsertNodeId) in this same batch.
         let mut pending: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -4231,11 +4583,62 @@ impl<F: Fs> GraphDb<F> {
         let mut next = u32::try_from(self.ids.len()).map_err(|_| GraphError::Corrupt {
             detail: "id space exhausted".into(),
         })?;
+        // Insert counts this frame has already raised. `edge_insert_count`
+        // reads committed state, which cannot see a count queued earlier in
+        // this same frame, so N duplicates of one pair would otherwise all
+        // compute `committed + 1` and the last would win.
+        let mut pending_counts: HashMap<(u32, u32, u32), u64> = HashMap::new();
         let lookup = |ids: &IdMap,
                       pending: &std::collections::HashMap<String, u32>,
                       key: &str|
          -> Option<u32> { ids.get(key).or_else(|| pending.get(key).copied()) };
         for rec in recs {
+            // A duplicate insert's count, resolved here and nowhere else.
+            //
+            // This is the only pass that knows the frame's own ids: a node
+            // created earlier in the same frame has no dense id until the
+            // `InsertNodeId` above allocates one, and an edge type first used in
+            // this frame is not in `syms` until `intern_wal` puts it there.
+            // Resolving the count in the batch's validate pass instead — where
+            // it used to live — meant that a duplicate whose endpoints or type
+            // were created in the same frame silently produced no count at all,
+            // which is exactly the shape a mirror rebuild writes (defect #24).
+            let rec = match rec {
+                PlannedRec::Rec(rec) => rec,
+                PlannedRec::DuplicateCount {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                } => {
+                    let (etype, intern) = self.intern_wal(&edge_type);
+                    if interned.insert(etype) {
+                        out.push(intern);
+                    }
+                    let src = lookup(&self.ids, &pending, &src_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing src {src_key}"),
+                        }
+                    })?;
+                    let dst = lookup(&self.ids, &pending, &dst_key).ok_or_else(|| {
+                        GraphError::Corrupt {
+                            detail: format!("dense WAL rewrite missing dst {dst_key}"),
+                        }
+                    })?;
+                    let count = pending_counts
+                        .get(&(etype, src, dst))
+                        .copied()
+                        .unwrap_or_else(|| self.edge_insert_count(etype, src, dst))
+                        .saturating_add(1);
+                    pending_counts.insert((etype, src, dst), count);
+                    out.push(WalRecord::SetEdgeCount {
+                        etype,
+                        src,
+                        dst,
+                        count,
+                    });
+                    continue;
+                }
+            };
             match rec {
                 WalRecord::InsertNode { label, key, props } => {
                     // Namespace validation and normalisation, on the one seam
@@ -5191,6 +5594,9 @@ impl<F: Fs> GraphDb<F> {
             // fired the EdgeFired/EdgeRetracted subscription events.
             | WalRecord::DerivedEdgeAdded { .. }
             | WalRecord::DerivedEdgeRetracted { .. }
+            // A count is not an edge event: the pair it counts already fired one
+            // when it was first inserted.
+            | WalRecord::SetEdgeCount { .. }
             | WalRecord::RenameNode { .. } => vec![],
         }
     }
@@ -5483,7 +5889,7 @@ impl<F: Fs> GraphDb<F> {
         // touches pending_write_authz); query_write_authz sets the field instead
         // and passes None.  Only one source is non-None per call.
         param_authz: Option<WriteAuthz>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<BatchOutcome> {
         // Read-only guard: catches empty-batch calls before the early-return
         // that skips log_then_apply_with, ensuring all mutation entry points fail.
         if self.read_only {
@@ -5553,15 +5959,94 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
+        let mut outcome = BatchOutcome::default();
         let recs = {
             let mut preview = MutPreview::new(self);
             let mut recs = Vec::with_capacity(ops.len());
+            // Which node row we are on, counted over the node-insert ops only.
+            // A caller that queues its rows in order reads this straight back
+            // as the index into its own list.
+            let mut node_row = 0usize;
+            // Every field name the store knows, which a `Replace` needs to work
+            // out what it removes. Resolved on the first `Replace` in the frame
+            // and reused, so N replaces read the field list once, not N times.
+            let mut store_fields: Option<Vec<String>> = None;
+            // Duplicate inserts this frame has to count, each paired with the
+            // position in `recs` it belongs at. The count itself is named in the
+            // dense rewrite and not here: a duplicate's endpoints and edge type
+            // may all be created by earlier ops in this same frame, and nothing
+            // in the frame has a dense id yet. See [`PlannedRec`].
+            let mut deferred_counts: Vec<(usize, String, String, String)> = Vec::new();
             for op in ops {
                 match op {
                     BatchOp::InsertNode { label, key, props } => {
-                        preview.check_insert_node(&key)?;
-                        preview.note_insert_node(&key, &props);
+                        node_row += 1;
+                        preview.check_insert_node(&key, &props)?;
+                        preview.note_insert_node(&label, &key, &props);
                         recs.push(WalRecord::InsertNode { label, key, props });
+                    }
+                    BatchOp::InsertNodeOnConflict {
+                        label,
+                        key,
+                        props,
+                        on_conflict,
+                    } => {
+                        let row = node_row;
+                        node_row += 1;
+                        if !preview.has_key(&key) {
+                            // No conflict: an ordinary insert on any policy —
+                            // except that a supplied view-owned field is the
+                            // same mistake here as on a taken key, and gets the
+                            // same row error rather than a frame error. Without
+                            // this, one op answered one request two ways
+                            // depending on whether the store already had the
+                            // key (defect #19).
+                            if let Some(why) = preview.supplied_view_owned_prop(&key, &props) {
+                                outcome.row_errors.push((row, why));
+                                continue;
+                            }
+                            preview.note_insert_node(&label, &key, &props);
+                            recs.push(WalRecord::InsertNode { label, key, props });
+                            continue;
+                        }
+                        match on_conflict {
+                            OnConflict::Error => {
+                                return Err(GraphError::DuplicateKey { key });
+                            }
+                            OnConflict::Skip => outcome.skipped += 1,
+                            OnConflict::Replace => {
+                                if store_fields.is_none() {
+                                    store_fields = Some(preview.db.props_view().field_names());
+                                }
+                                let fields = store_fields.as_deref().unwrap_or_default();
+                                match preview.plan_replace(&label, &key, &props, fields) {
+                                    Ok((writes, kept_view_owned)) => {
+                                        outcome.kept_view_owned += kept_view_owned;
+                                        for (field, value) in writes {
+                                            match value {
+                                                Some(value) => {
+                                                    preview.note_set_prop(&key, &field, &value);
+                                                    recs.push(WalRecord::SetProp {
+                                                        key: key.clone(),
+                                                        field,
+                                                        value,
+                                                    });
+                                                }
+                                                None => {
+                                                    preview.note_remove_prop(&key, &field);
+                                                    recs.push(WalRecord::RemoveProp {
+                                                        key: key.clone(),
+                                                        field,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        outcome.replaced += 1;
+                                    }
+                                    Err(why) => outcome.row_errors.push((row, why)),
+                                }
+                            }
+                        }
                     }
                     BatchOp::InsertEdge {
                         edge_type,
@@ -5575,6 +6060,17 @@ impl<F: Fs> GraphDb<F> {
                                 src_key,
                                 dst_key,
                             });
+                        } else if preview.db.multiplicity {
+                            // A duplicate inside a batch counts the way a
+                            // duplicate through `insert_edge` does: `ingest` and
+                            // Cypher `CREATE` reach this choke-point and not
+                            // that one, and a count only one entry point keeps
+                            // would be worse than no count at all.
+                            //
+                            // This is the one gate on discriminant 23 from the
+                            // batch path: a store that never opted in queues
+                            // nothing here and so writes no such record.
+                            deferred_counts.push((recs.len(), edge_type, src_key, dst_key));
                         }
                     }
                     BatchOp::SetProp { key, field, value } => {
@@ -5641,8 +6137,10 @@ impl<F: Fs> GraphDb<F> {
                         // Rules fire and last-change is updated for each created node.
                         for key in [&src_key, &dst_key] {
                             if !preview.has_key(key) {
-                                preview.check_insert_node(key)?;
-                                preview.note_insert_node(key, &[]);
+                                // A placeholder endpoint carries no props, so
+                                // the view-owned check has nothing to refuse.
+                                preview.check_insert_node(key, &[])?;
+                                preview.note_insert_node(&placeholder_label, key, &[]);
                                 recs.push(WalRecord::InsertNode {
                                     label: placeholder_label.clone(),
                                     key: key.clone(),
@@ -5657,30 +6155,62 @@ impl<F: Fs> GraphDb<F> {
                                 src_key,
                                 dst_key,
                             });
+                        } else if preview.db.multiplicity {
+                            // Same choke-point, same gate as `BatchOp::InsertEdge`
+                            // above: an upsert that finds the pair already there
+                            // is a duplicate insert and counts as one.
+                            deferred_counts.push((recs.len(), edge_type, src_key, dst_key));
                         }
                     }
                 }
             }
-            recs
+            // Splice the deferred counts back into the positions they were
+            // raised at, so a count still sits exactly where the duplicate did
+            // — before any later op in the frame that deletes the pair.
+            let mut planned: Vec<PlannedRec> =
+                Vec::with_capacity(recs.len() + deferred_counts.len());
+            let mut deferred = deferred_counts.into_iter().peekable();
+            for (i, rec) in recs.into_iter().enumerate() {
+                while deferred.peek().is_some_and(|(at, ..)| *at == i) {
+                    let (_, edge_type, src_key, dst_key) = deferred.next().expect("just peeked");
+                    planned.push(PlannedRec::DuplicateCount {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    });
+                }
+                planned.push(PlannedRec::Rec(rec));
+            }
+            for (_, edge_type, src_key, dst_key) in deferred {
+                planned.push(PlannedRec::DuplicateCount {
+                    edge_type,
+                    src_key,
+                    dst_key,
+                });
+            }
+            planned
         };
+        // A frame that is nothing but skips or refused rows writes no WAL, but
+        // it still has counts to report, so the early returns carry `outcome`
+        // rather than zeros.
         if recs.is_empty() {
-            return Ok((0, 0));
+            return Ok(outcome);
         }
         // rewrite_wal_dense converts every InsertNode/InsertEdge into its
         // *Id form, so only the dense variants can appear in `recs` here.
-        let recs = self.rewrite_wal_dense(recs)?;
+        let recs = self.rewrite_wal_dense_planned(recs)?;
         // The rewrite can empty a non-empty batch: a `SET n.ns` naming the
         // namespace the node is already in is a no-op and is dropped there. An
         // empty `Batch` frame would still take a commit sequence and a WAL
         // record, so a batch that turns out to be nothing writes nothing.
         if recs.is_empty() {
-            return Ok((0, 0));
+            return Ok(outcome);
         }
-        let nodes_inserted = recs
+        outcome.nodes_inserted = recs
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertNodeId { .. }))
             .count();
-        let edges_inserted = recs
+        outcome.edges_inserted = recs
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertEdgeId { .. }))
             .count();
@@ -5691,11 +6221,11 @@ impl<F: Fs> GraphDb<F> {
         // short-circuit on single-op batches and silently skip the fsync.
         // Batched fsyncs only for multi-op batches; Relaxed always skips.
         self.log_then_apply_with(WalRecord::Batch(recs), ingest, self.fsync)?;
-        Ok((nodes_inserted, edges_inserted))
+        Ok(outcome)
     }
 
     fn commit_batch(&mut self, ops: Vec<BatchOp>) -> Result<(usize, usize)> {
-        self.commit_logged_batch(ops, None, None)
+        self.commit_logged_batch(ops, None, None).map(inserted_pair)
     }
 
     /// Commit one submission WITHOUT an fsync — for use inside `commit_group`
@@ -5719,7 +6249,7 @@ impl<F: Fs> GraphDb<F> {
         // SAFETY: raw pointer into self; guard dropped within this frame.
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
-        self.commit_logged_batch(ops, None, None)
+        self.commit_logged_batch(ops, None, None).map(inserted_pair)
     }
 
     /// Commit multiple op-batches as a **group**: each submission gets its own
@@ -5796,7 +6326,7 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
-        MutPreview::new(self).check_insert_node(key)?;
+        MutPreview::new(self).check_insert_node(key, &props)?;
         self.log_dense(vec![WalRecord::InsertNode {
             label: label.into(),
             key: key.into(),
@@ -5804,11 +6334,27 @@ impl<F: Fs> GraphDb<F> {
         }])
     }
 
+    /// Insert a user edge. `Ok(true)` when the pair was new, `Ok(false)` when it
+    /// was already there — the question is "was this pair new", and a duplicate
+    /// does not make it so.
+    ///
+    /// On a store that called [`enable_multiplicity`](Self::enable_multiplicity)
+    /// a duplicate is no longer a total no-op: it raises the pair's insert count
+    /// (§5.13). Adjacency is still a set, so [`degree`](Self::degree) is
+    /// unchanged and the return value is still `Ok(false)`; the count is visible
+    /// only through [`degree_multiplicity`](Self::degree_multiplicity) and the
+    /// reserved [`EDGE_COUNT_PROP`]. On every other store a duplicate writes
+    /// nothing at all, as it always has.
     pub fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> Result<bool> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
         if !MutPreview::new(self).prepare_insert_edge(edge_type, src_key, dst_key)? {
+            // The pair exists. The only thing left to record is that it was
+            // asked for again, and only where the store asked to be told.
+            if let Some(rec) = self.edge_count_record(edge_type, src_key, dst_key) {
+                self.log_then_apply(rec)?;
+            }
             return Ok(false);
         }
         self.log_dense(vec![WalRecord::InsertEdge {
@@ -5867,14 +6413,12 @@ impl<F: Fs> GraphDb<F> {
 
     /// Remove a property. Returns `Ok(false)` (and does not log) if the field
     /// is already absent. Unknown or tombstoned keys are `Err(KeyNotFound)`.
+    /// A field a view owns is `Err(ViewPropReadOnly)` — stated once, in
+    /// [`MutPreview::prepare_remove_prop`], so that the batch ops reaching that
+    /// same choke-point cannot miss it.
     pub fn remove_prop(&mut self, key: &str, field: &str) -> Result<bool> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
-        }
-        if let Some(view_name) = self.view_store.view_for_prop(field) {
-            return Err(GraphError::ViewPropReadOnly {
-                view_name: view_name.to_string(),
-            });
         }
         if !MutPreview::new(self).prepare_remove_prop(key, field)? {
             return Ok(false);
@@ -6455,6 +6999,201 @@ impl<F: Fs> GraphDb<F> {
         self.prop_index.is_enabled(label, field)
     }
 
+    /// Start recording insert-count multiplicity on this store (§5.13).
+    ///
+    /// Adjacency stays a set and nothing about an existing read changes: a
+    /// duplicate [`insert_edge`](Self::insert_edge) still returns `Ok(false)`
+    /// and still leaves [`degree`](Self::degree) alone. What it gains is that
+    /// the duplicate is *counted*, as the reserved edge property
+    /// [`EDGE_COUNT_PROP`], readable through
+    /// [`degree_multiplicity`](Self::degree_multiplicity).
+    ///
+    /// # This is a one-way step, and that is why it is a call
+    ///
+    /// The count is durable, so it is written to the WAL — as discriminant 23,
+    /// which no release before v0.6.10 knows. A reader meeting an unknown WAL
+    /// discriminant cannot know what the record would have changed, so it
+    /// cannot degrade the way an unreadable index blob can. **After this call
+    /// the store can no longer be read by an older binary, and there is no call
+    /// that undoes it.** Gating the record behind this method is what keeps
+    /// that step a decision an operator makes when they want the feature,
+    /// rather than one everybody takes by upgrading.
+    ///
+    /// # It fails loudly, and that costs a snapshot
+    ///
+    /// An older binary does not refuse discriminant 23 — it truncates the WAL
+    /// at it and, with `repair_wal`, persists the truncation. So this call also
+    /// writes a **V10 snapshot**, a version no earlier release knows, and it
+    /// writes it *first*: the snapshot is read before the WAL, so an older
+    /// binary stops at `snapshot: unsupported version 10` with the WAL
+    /// untouched. Taking the snapshot before appending the record is what makes
+    /// the guard unconditional — the store is never, at any interruption point,
+    /// carrying the record without the stamp that announces it.
+    ///
+    /// The snapshot keeps the WAL (`keep_wal: true`): opting in is not a
+    /// compaction, and history reachable by [`open_at`](Self::open_at) stays
+    /// reachable. On a large store the call therefore costs one full snapshot
+    /// write.
+    ///
+    /// # What it costs a store that archives
+    ///
+    /// Writing `snapshot.bin` is also how the archive path decides whether the
+    /// store may have a *genesis chain* — whether `open_at` can replay
+    /// archive-resident commits from empty state. The rule is conservative: a
+    /// snapshot that was already on disk might have been a truncating one, and
+    /// once the handle that took it is gone this binary cannot tell. A
+    /// `keep_wal` snapshot taken by **this** handle is the case where it can, so
+    /// opting in and then archiving **in the same session** keeps the chain.
+    ///
+    /// Opting in, closing the store, and archiving in a *later* session does
+    /// not — but that is the answer any store with a prior snapshot gets, not
+    /// something this call causes. A store that wants the chain should take its
+    /// first archive in the session that opted in.
+    ///
+    /// Calling it on a store that has already opted in writes nothing and
+    /// returns `Ok(())`: an operator should not have to ask first.
+    ///
+    /// # This call is not atomic, and an `Err` does not undo it
+    ///
+    /// There is no rollback here, and there never was one. An `Err` means this
+    /// handle stopped believing the store is opted in — `self.multiplicity` is
+    /// reset, so this handle reports `false` from then on — and nothing more. It
+    /// says nothing about what reached disk. Two reachable failures leave the
+    /// opt-in standing:
+    ///
+    /// * **The declaration landed and only its fsync failed.** `log_then_apply`
+    ///   appends, then syncs; a failed barrier leaves `MULTIPLICITY_ENABLED`
+    ///   already in `wal.bin`. The next open replays it and the store is opted
+    ///   in. No archive is involved — this one predates the recovery below.
+    /// * **The declaration never landed, but the V10 snapshot did, on a store
+    ///   that already had an archive.** The open-time recovery in
+    ///   `load_from_disk` reads V10-beside-an-archive as an interrupted archive
+    ///   sequence and opts the store in.
+    ///
+    /// So a failed call may leave the opt-in on disk immediately (the first
+    /// case) or conjure it at the next open (the second), and nothing puts the
+    /// store back out. Treat `Err` as "the outcome is unknown", not as "nothing
+    /// happened".
+    ///
+    /// **This is safe, and the ordering is the reason.** The V10 stamp is
+    /// written *before* the declaration, so every one of these intermediate
+    /// states is one an older binary refuses by name rather than truncates at.
+    /// The failure direction costs a refusal, never a commit. That ordering is
+    /// the property worth protecting, not the atomicity this call never had.
+    ///
+    /// **To know where the store stands, ask the store.** Reopen it and call
+    /// [`is_multiplicity_enabled`](Self::is_multiplicity_enabled); that is the
+    /// only answer that accounts for what reached disk.
+    ///
+    /// The one case that really does leave the store opted out is a failure with
+    /// no archive present and no record written: a stray V10 snapshot remains,
+    /// costing an older reader a refusal it did not strictly need, and *that*
+    /// store's next snapshot rewrites at V9.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - Anything [`snapshot_with`](Self::snapshot_with) can return, and
+    ///   anything the WAL append or its fsync can return. See the atomicity
+    ///   section above for what the store is left holding.
+    pub fn enable_multiplicity(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.multiplicity {
+            return Ok(());
+        }
+        // The snapshot goes first, and the order is the guard.
+        //
+        // An older reader refuses a V10 snapshot by name and stops; it does not
+        // refuse discriminant 23, it truncates the WAL at it. So the store must
+        // never hold the record without the snapshot that announces it — not
+        // even for the width of one fsync. Writing the snapshot before the
+        // record makes the only reachable intermediate state "V10 snapshot, no
+        // record", which is merely conservative: this binary reads it as a
+        // store that has not opted in, and an older one refuses it.
+        //
+        // `keep_wal: true` because opting in is not a compaction: an operator
+        // asking for multiplicity has not asked to lose the history `open_at`
+        // can reach.
+        self.multiplicity = true;
+        let forced = self
+            .snapshot_with(SnapshotOptions {
+                keep_wal: true,
+                ..SnapshotOptions::default()
+            })
+            .and_then(|()| self.log_then_apply(core_storage::wal::MULTIPLICITY_ENABLED));
+        if forced.is_err() {
+            // This handle stops believing it is opted in. That is all this line
+            // does — it is not a rollback, and cannot be one: the declaration
+            // may already be in `wal.bin` (the append succeeded and only the
+            // fsync failed), and even when it is not, the V10 snapshot beside an
+            // existing archive is enough for the open-time recovery to opt the
+            // store in. See the "not atomic" section on this method.
+            //
+            // It fails in the safe direction either way: the V10 stamp reached
+            // disk before anything a v0.6.9 reader would truncate at, so the
+            // worst an interruption costs that reader is a refusal by name.
+            self.multiplicity = false;
+        }
+        forced
+    }
+
+    /// Whether this store records insert-count multiplicity.
+    ///
+    /// `false` on every store that has not called
+    /// [`enable_multiplicity`](Self::enable_multiplicity) — which is every
+    /// store that did not ask for it, including one upgraded from an earlier
+    /// release.
+    pub fn is_multiplicity_enabled(&self) -> bool {
+        self.multiplicity
+    }
+
+    /// How many times `(etype, src, dst)` has been inserted: the reserved
+    /// `count` edge property, or 1 when it is absent.
+    ///
+    /// Answers 1 for a pair on a store that never opted in, which is the truth
+    /// available there — the pair was inserted at least once, and the store
+    /// kept no record of any second insert.
+    fn edge_insert_count(&self, etype: u32, src: u32, dst: u32) -> u64 {
+        match self.edge_props_view().get(etype, src, dst, EDGE_COUNT_PROP) {
+            Some(Value::Int(n)) if n > 0 => n as u64,
+            _ => 1,
+        }
+    }
+
+    /// The `SetEdgeCount` record a duplicate insert of `(edge_type, src_key,
+    /// dst_key)` should log, or `None` when nothing should be written.
+    ///
+    /// `None` when the store has not opted in, so **no discriminant-23 record
+    /// is written at all** — the gate the whole feature rests on.
+    ///
+    /// The other two `None`s are unreachable from the one caller. This is the
+    /// single-mutation path, where `prepare_insert_edge` has already refused a
+    /// missing endpoint and an existing pair's edge type is necessarily
+    /// interned. A batch is the case where a pair's endpoints and type can all
+    /// be created by the same frame, and it does not come through here: it
+    /// queues a [`PlannedRec::DuplicateCount`] and names the count in the dense
+    /// rewrite, which is the only pass that knows the frame's own ids.
+    fn edge_count_record(
+        &self,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+    ) -> Option<WalRecord> {
+        if !self.multiplicity {
+            return None;
+        }
+        let etype = self.syms.get(edge_type)?;
+        let src = self.ids.get(src_key)?;
+        let dst = self.ids.get(dst_key)?;
+        Some(WalRecord::SetEdgeCount {
+            etype,
+            src,
+            dst,
+            count: self.edge_insert_count(etype, src, dst).saturating_add(1),
+        })
+    }
+
     /// Search a full-text-indexed field.
     ///
     /// Returns `(node_key, match_count)` pairs sorted by match_count descending,
@@ -6561,6 +7300,67 @@ impl<F: Fs> GraphDb<F> {
         label: Option<&str>,
         k: usize,
     ) -> Vec<(String, f64)> {
+        self.search_hybrid_inner(
+            text_field,
+            query_text,
+            vector_field,
+            query_vec,
+            label,
+            k,
+            None,
+        )
+    }
+
+    /// [`search_hybrid`](Self::search_hybrid) with **each leg** filtered to the
+    /// mask before the fusion.
+    ///
+    /// Filtering the fused list afterwards would quietly return fewer than `k`.
+    /// Each leg over-fetches `4*k` candidates, so when the visible nodes rank
+    /// below `4*k` hidden ones neither leg carries them into the fusion at all
+    /// and the post-filter has nothing left to keep. Filtering first spends the
+    /// `4*k` on **visible** hits, so a scoped call is as long as the corpus it
+    /// can see allows.
+    ///
+    /// The ranks that enter RRF are therefore the ranks of the visible corpus,
+    /// not the visible entries of the store-wide ranking. The constant stays 60
+    /// and the tiebreak stays key-ascending.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_hybrid_scoped(
+        &self,
+        text_field: &str,
+        query_text: &str,
+        vector_field: &str,
+        query_vec: &[f64],
+        label: Option<&str>,
+        k: usize,
+        mask: &crate::mask::NodeMask,
+    ) -> Vec<(String, f64)> {
+        self.search_hybrid_inner(
+            text_field,
+            query_text,
+            vector_field,
+            query_vec,
+            label,
+            k,
+            Some(mask),
+        )
+    }
+
+    /// The body shared by [`search_hybrid`](Self::search_hybrid) and
+    /// [`search_hybrid_scoped`](Self::search_hybrid_scoped). `mask = None` is
+    /// the unscoped contract unchanged: the filter below is then a no-op and
+    /// the vector leg is the same unmasked call it has always been.
+    #[allow(clippy::too_many_arguments)]
+    fn search_hybrid_inner(
+        &self,
+        text_field: &str,
+        query_text: &str,
+        vector_field: &str,
+        query_vec: &[f64],
+        label: Option<&str>,
+        k: usize,
+        mask: Option<&crate::mask::NodeMask>,
+    ) -> Vec<(String, f64)> {
         use std::collections::HashMap;
 
         const RRF_K: f64 = 60.0;
@@ -6569,16 +7369,37 @@ impl<F: Fs> GraphDb<F> {
         // Accumulate per-node RRF scores.
         let mut scores: HashMap<String, f64> = HashMap::new();
 
-        // Text leg.
+        // Text leg. The mask bites on the candidates, before `take(pool)`, so
+        // the over-fetch is a budget of visible hits rather than one a hidden
+        // prefix can exhaust.
         let text_hits = self.search(text_field, query_text);
-        for (rank0, (key, _count)) in text_hits.into_iter().take(pool).enumerate() {
+        let visible_text = text_hits
+            .into_iter()
+            .filter(|(key, _count)| mask.is_none_or(|m| m.contains_node(self, key)));
+        for (rank0, (key, _count)) in visible_text.take(pool).enumerate() {
             let rank = (rank0 + 1) as f64;
             *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
         }
 
-        // Vector leg (skipped when query_vec is empty).
+        // Vector leg (skipped when query_vec is empty). The masked variant
+        // applies the mask before its own k-truncation, for the same reason.
         if !query_vec.is_empty() {
-            let vec_hits = self.find_similar_vector(vector_field, label, query_vec, pool, 0.0);
+            // `ExactnessCaller::Hybrid`: the leg is the same one
+            // `find_similar_vector_masked` runs, but the advice its warning
+            // gives has to fit *this* signature, which has no `exact`.
+            let vec_hits = self
+                .find_similar_vector_as(
+                    vector_field,
+                    label,
+                    query_vec,
+                    pool,
+                    0.0,
+                    mask,
+                    None,
+                    false,
+                    ExactnessCaller::Hybrid,
+                )
+                .expect("find_similar_vector_as is infallible without where_");
             for (rank0, (key, _sim)) in vec_hits.into_iter().enumerate() {
                 let rank = (rank0 + 1) as f64;
                 *scores.entry(key).or_insert(0.0) += 1.0 / (RRF_K + rank);
@@ -7269,11 +8090,7 @@ impl<F: Fs> GraphDb<F> {
 
     /// Resolve `role` against the current graph, ignoring the memo.
     fn build_mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
-        let roles = self.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
-            detail:
-                "roles.json was corrupt at open; fix the file and re-open to restore role access"
-                    .into(),
-        })?;
+        let roles = self.roles.as_ref().ok_or_else(roles_poisoned)?;
         let def = roles
             .iter()
             .find(|r| r.name == role)
@@ -7334,9 +8151,29 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Returns an empty list when no roles are defined or when `roles.json`
     /// was corrupt at open (check [`mask_for_role`](Self::mask_for_role) for
-    /// the fail-loud error in that case).
+    /// the fail-loud error in that case, or call
+    /// [`roles_checked`](Self::roles_checked), which is this readout with that
+    /// error in it).
     pub fn roles(&self) -> Vec<RoleDef> {
         self.roles.as_deref().unwrap_or(&[]).to_vec()
+    }
+
+    /// The role definitions, or the poison error when `roles.json` was corrupt
+    /// at open.
+    ///
+    /// [`roles`](Self::roles) answers `[]` both for a store that defines no
+    /// roles and for one whose sidecar did not parse, and a caller validating a
+    /// role name at boot cannot tell those apart. The wrong reading of the pair
+    /// is the dangerous one: a store with no roles at all is an unrestricted
+    /// store, so a poisoned file would read as "nothing is restricted here".
+    ///
+    /// This is the same answer, for the same cause, that
+    /// [`mask_for_role`](Self::mask_for_role) gives on the first read.
+    pub fn roles_checked(&self) -> Result<Vec<RoleDef>> {
+        match self.roles.as_deref() {
+            Some(roles) => Ok(roles.to_vec()),
+            None => Err(roles_poisoned()),
+        }
     }
 
     // ── Role-scoped write authz ───────────────────────────────────────────────
@@ -7357,6 +8194,7 @@ impl<F: Fs> GraphDb<F> {
     ) -> Result<(usize, usize)> {
         // Thread authz as a direct parameter — never touches pending_write_authz.
         self.commit_logged_batch(ops, None, authz.cloned())
+            .map(inserted_pair)
     }
 
     /// Execute a Cypher write statement with role-scoped write authorization.
@@ -7449,6 +8287,7 @@ impl<F: Fs> GraphDb<F> {
         let _g = RestoreFsync(&mut self.fsync as *mut FsyncPolicy, saved);
         self.fsync = FsyncPolicy::Relaxed;
         self.commit_logged_batch(ops, None, authz.cloned())
+            .map(inserted_pair)
     }
 
     /// Execute a `/ingest` request with role-scoped write authorization.
@@ -7583,7 +8422,17 @@ impl<F: Fs> GraphDb<F> {
             // RenameNode / CreateRule / DeleteRule: defense-in-depth gate.
             // These ops are never routed to role-scoped paths by the HTTP layer,
             // but we 403 them here to close any future bypass route.
-            BatchOp::RenameNode { .. } | BatchOp::CreateRule(_) | BatchOp::DeleteRule { .. } => {
+            //
+            // InsertNodeOnConflict joins them: it is reachable only from the
+            // embedded Python binding, which has no role token, and `Replace`
+            // is a create and an update at once. Rather than split the decision
+            // table for an op no role-scoped path constructs, refuse it — a
+            // role-scoped caller writes through the ops that are already in the
+            // table.
+            BatchOp::RenameNode { .. }
+            | BatchOp::CreateRule(_)
+            | BatchOp::DeleteRule { .. }
+            | BatchOp::InsertNodeOnConflict { .. } => {
                 return Err(GraphError::RoleWriteDenied {
                     reason: "role-bound token: this endpoint is not permitted".into(),
                 });
@@ -8015,6 +8864,35 @@ impl<F: Fs> GraphDb<F> {
         Some(rs)
     }
 
+    /// [`neighborhood_masked`](Self::neighborhood_masked) with the **subject
+    /// check** a scoped caller needs: a start key the mask hides answers exactly
+    /// as an absent one does.
+    ///
+    /// `neighborhood_masked` expands from any existing key, hidden or not,
+    /// because a full-token caller supplying a client mask already knows which
+    /// keys exist. A scoped caller does not, so telling it apart a hidden key
+    /// from an absent one would be an existence oracle.
+    ///
+    /// Expansion itself is unchanged: hidden nodes are neither returned nor used
+    /// as traversal intermediaries, so a visible node reachable only through a
+    /// hidden one stays out of the result.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
+    pub fn neighborhood_scoped(
+        &self,
+        key: &str,
+        depth: u32,
+        edge_types: Option<&[&str]>,
+        dir: Dir,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<ResultSet> {
+        if !mask.contains_node(self, key) {
+            return Err(GraphError::KeyNotFound { key: key.into() });
+        }
+        self.neighborhood_masked(key, depth, edge_types, dir, mask)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })
+    }
+
     /// Live node's key, label, and columnar props. Unknown or tombstoned → `None`.
     pub fn node_info(&self, key: &str) -> Option<NodeInfo> {
         let n = self.node_ref(key)?;
@@ -8131,6 +9009,41 @@ impl<F: Fs> GraphDb<F> {
             a.edge_type == b.edge_type && a.src_key == b.src_key && a.dst_key == b.dst_key
         });
         Ok(edges)
+    }
+
+    /// [`node_edges_masked`](Self::node_edges_masked) with the **subject check**
+    /// a scoped caller needs, and a plain [`EdgeInfo`] list.
+    ///
+    /// `node_edges_masked` raises [`GraphError::KeyNotFound`] only when `key` is
+    /// unknown; a key that exists but is hidden still yields its (filtered) edge
+    /// list, which is correct for a full-token client mask and an existence
+    /// oracle for a scoped one. Here a hidden subject answers exactly as an
+    /// absent one does.
+    ///
+    /// Every edge naming a hidden endpoint is dropped, whatever the mask's
+    /// [`MaskMode`](crate::mask::MaskMode): a scoped caller never sees a
+    /// restricted stub, so there is nothing for it to render.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
+    pub fn node_edges_scoped(
+        &self,
+        key: &str,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<EdgeInfo>> {
+        if !mask.contains_node(self, key) {
+            return Err(GraphError::KeyNotFound { key: key.into() });
+        }
+        Ok(self
+            .node_edges_masked(key, mask)?
+            .into_iter()
+            .filter(|e| !e.src_restricted && !e.dst_restricted)
+            .map(|e| EdgeInfo {
+                edge_type: e.edge_type,
+                src_key: e.src_key,
+                dst_key: e.dst_key,
+                derived: e.derived,
+            })
+            .collect())
     }
 
     /// Every directed edge incident on `key`, both directions, every etype.
@@ -8720,6 +9633,35 @@ impl<F: Fs> GraphDb<F> {
         where_: Option<&PropPredicate>,
         exact: bool,
     ) -> Result<Vec<(String, f64)>> {
+        self.find_similar_vector_as(
+            field,
+            label,
+            q,
+            k,
+            min,
+            mask,
+            where_,
+            exact,
+            ExactnessCaller::Vector,
+        )
+    }
+
+    /// [`find_similar_vector_filtered`](Self::find_similar_vector_filtered)
+    /// with the caller shape named, so the exactness warning can advise the
+    /// signature that actually reached it. Everything else is identical.
+    #[allow(clippy::too_many_arguments)]
+    fn find_similar_vector_as(
+        &self,
+        field: &str,
+        label: Option<&str>,
+        q: &[f64],
+        k: usize,
+        min: f64,
+        mask: Option<&crate::mask::NodeMask>,
+        where_: Option<&PropPredicate>,
+        exact: bool,
+        caller: ExactnessCaller,
+    ) -> Result<Vec<(String, f64)>> {
         if let Some(pred) = where_ {
             pred.validate_named("where")
                 .map_err(|detail| GraphError::QueryError { detail })?;
@@ -8750,7 +9692,7 @@ impl<F: Fs> GraphDb<F> {
         if !skip_hnsw {
             if let Some(mask) = mask {
                 if let Some(out) =
-                    self.find_similar_hnsw_masked(field, label, &q_unit, k, min, mask)
+                    self.find_similar_hnsw_masked(field, label, &q_unit, k, min, mask, caller)
                 {
                     return Ok(out);
                 }
@@ -8810,6 +9752,7 @@ impl<F: Fs> GraphDb<F> {
 
     /// Masked HNSW widening beam. `None` when no index covers the request or
     /// the beam cannot admit `k` visible hits (caller falls through to brute).
+    #[allow(clippy::too_many_arguments)]
     fn find_similar_hnsw_masked(
         &self,
         field: &str,
@@ -8818,12 +9761,16 @@ impl<F: Fs> GraphDb<F> {
         k: usize,
         min: f64,
         mask: &crate::mask::NodeMask,
+        caller: ExactnessCaller,
     ) -> Option<Vec<(String, f64)>> {
         let index_len = match label {
             Some(lbl) => self.engine.hnsw_dst_len(field, lbl, q_unit.len()),
             None => self.engine.hnsw_any_dst_len(field, q_unit.len()),
         };
         let n = index_len?;
+        // The `?` above is the coverage test: past it, an index exists and this
+        // masked, non-exact call is about to ride it.
+        self.note_ambiguous_exactness(field, label, caller);
         // Same ceiling the exact-rule widening loop in `hnsw_candidates`
         // consults — including the `with_ef_max` test hook.
         let cap = ef_max();
@@ -8859,6 +9806,54 @@ impl<F: Fs> GraphDb<F> {
             }
             ef = ef.saturating_mul(2);
         }
+    }
+
+    /// Say once, per `(field, label)` index and caller shape, that a masked
+    /// search is answering approximately.
+    ///
+    /// A mask narrows *which nodes may be returned*. It does not choose a
+    /// kernel — `exact=true` and a `where=` predicate do, and nothing else
+    /// does. A caller who needed exact answers, passed `mask=` alone, and read
+    /// the mask as a promise of exhaustiveness gets a correct-looking
+    /// approximate answer and no signal at all; that is a silent wrong answer,
+    /// and it has cost an integration team real time.
+    ///
+    /// The fix is a question, not a behaviour change. Making a mask imply
+    /// `exact` would turn every existing masked caller's ANN into an O(n) GEMM
+    /// without asking them, which is a worse trade than the ambiguity.
+    ///
+    /// Printed once per index for the reason the dimension-mismatch skip in
+    /// `core_rules::hnsw` is: a line on every call is a line callers learn to
+    /// scroll past.
+    ///
+    /// `caller` decides the advice. The same leg is reached from two signatures
+    /// and only one of them has an `exact` argument to pass; see
+    /// [`ExactnessCaller`].
+    fn note_ambiguous_exactness(&self, field: &str, label: Option<&str>, caller: ExactnessCaller) {
+        let entry = (field.to_string(), label.unwrap_or("").to_string(), caller);
+        let first = match self.warned_ambiguous_exactness.lock() {
+            Ok(mut seen) => seen.insert(entry),
+            Err(poisoned) => poisoned.into_inner().insert(entry),
+        };
+        if !first {
+            return;
+        }
+        AMBIGUOUS_EXACTNESS_WARNS.with(|c| c.set(c.get().saturating_add(1)));
+        let which = match label {
+            Some(lbl) => format!(" (label `{lbl}`)"),
+            None => String::new(),
+        };
+        let subject = caller.subject();
+        let advice = caller.advice();
+        let line = format!(
+            "mushroomdb: {subject} on field `{field}`{which} is answering \
+             approximately. A mask narrows which nodes may be returned; it does not \
+             change which kernel runs, and an index covers this field. For an exact \
+             answer over the same visible candidate set, {advice} Further masked \
+             searches of this shape on this index are silent."
+        );
+        AMBIGUOUS_EXACTNESS_LAST.with(|c| *c.borrow_mut() = Some(line.clone()));
+        eprintln!("{line}");
     }
 
     /// `label ∩ mask ∩ holds(where)`. Index fast path when `label` is `Some`
@@ -9048,6 +10043,38 @@ impl<F: Fs> GraphDb<F> {
         Ok(out)
     }
 
+    /// [`pairwise_similar`](Self::pairwise_similar) over the keys the mask
+    /// admits — intersected **before** the matmul, never filtered after it.
+    ///
+    /// A hidden vector packed into the Gram is a row every visible key is
+    /// scored against. It can take a visible neighbour's place in the top-`k`,
+    /// and because the packed dimension is a majority vote over the candidate
+    /// rows it can decide whether a visible pair is scored at all. Dropping
+    /// hidden names from the finished answer leaves both effects standing, so
+    /// the intersection happens first and the answer is byte-for-byte the one
+    /// `pairwise_similar` gives for the visible keys alone.
+    ///
+    /// The caps therefore measure the **post-filter** count: a key set over
+    /// [`PAIRWISE_MAX_N`](crate::PAIRWISE_MAX_N) unscoped can come under it
+    /// scoped and succeed, because the work the cap refuses is work this call
+    /// no longer does. A filtered count still over the cap is still refused.
+    #[allow(clippy::type_complexity)]
+    pub fn pairwise_similar_scoped(
+        &self,
+        keys: &[&str],
+        field: &str,
+        k: usize,
+        min: f64,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<(String, Vec<(String, f64)>)>> {
+        let visible: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| mask.contains_node(self, key))
+            .collect();
+        self.pairwise_similar(&visible, field, k, min)
+    }
+
     /// Neighbours of packed row `i`: drop self, keep `score >= min`, sort
     /// `(sim desc, key asc)`, truncate to `k`. Packed srcs with no survivors
     /// still appear as `(src, [])`.
@@ -9091,7 +10118,7 @@ impl<F: Fs> GraphDb<F> {
         let mut out: Vec<(String, f64)> = hits
             .iter()
             .copied()
-            .filter(|&(id, _)| mask.visible.contains(&id))
+            .filter(|&(id, _)| mask.contains_id(id))
             .filter_map(|(id, _)| {
                 let sim = exact_vector_similarity(&view, id, field, q_unit)?;
                 if sim < min {
@@ -9343,6 +10370,25 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         let rel_vars = pattern_rel_vars(&stmt.matches);
+        // `count` is the engine's, on an edge: it is the insert-count §5.13
+        // maintains, and a `SET` that overwrote it would make the number mean
+        // whatever the last writer said rather than how many times the pair was
+        // inserted. Refused by name here, before the match runs, so the caller
+        // is told what is actually wrong instead of meeting the executor's
+        // generic "did not resolve to a node key" — and so the answer does not
+        // depend on whether the pattern happened to match a row. The same name
+        // on a *node* is an ordinary property and is untouched.
+        for s in &stmt.sets {
+            if s.field == EDGE_COUNT_PROP && rel_vars.iter().any(|r| r == &s.var) {
+                return Err(GraphError::QueryError {
+                    detail: format!(
+                        "cannot SET {}.{EDGE_COUNT_PROP}: `{EDGE_COUNT_PROP}` is a reserved edge \
+                         property holding the pair's insert count",
+                        s.var
+                    ),
+                });
+            }
+        }
         let mut lookup_vars = set_vars.clone();
         for v in pattern_node_vars(&stmt.matches) {
             add_var(&mut lookup_vars, &v);
@@ -10020,6 +11066,136 @@ impl<F: Fs> GraphDb<F> {
         Ok(results)
     }
 
+    /// [`explain`](Self::explain) with the scoped read contract (§5.3): both
+    /// endpoints are subject-checked, and any explanation whose evidence runs
+    /// through a hidden node is **dropped entirely, not redacted**.
+    ///
+    /// A plain two-node rule's evidence is the pair itself, so once both
+    /// subjects are visible there is nothing left to hide. A **via-hop** rule is
+    /// different: it fires `src → dst` because some node carrying `via_label`
+    /// sits between them, and [`Explanation`] carries the hop's edge *type*
+    /// (`via_edge`) and never the hop's key. There is no field to blank, so a
+    /// redacted explanation would still say "these two are linked through
+    /// something you cannot see" — which discloses that the something exists.
+    /// The explanation is therefore kept only when at least one **visible** via
+    /// node satisfies the rule on its own.
+    ///
+    /// The weight is the **visible corpus's** number, not the store's: a via-hop
+    /// rule stores the max over every via it hopped through, so the stored value
+    /// can be a score only a hidden via produced. It is recomputed over the
+    /// visible vias alone.
+    ///
+    /// Hidden or unknown `key_a` or `key_b` → [`GraphError::KeyNotFound`].
+    pub fn explain_scoped(
+        &self,
+        key_a: &str,
+        key_b: &str,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<Explanation>> {
+        for key in [key_a, key_b] {
+            if !mask.contains_node(self, key) {
+                return Err(GraphError::KeyNotFound { key: key.into() });
+            }
+        }
+        Ok(self
+            .explain(key_a, key_b)?
+            .into_iter()
+            .filter_map(|e| self.scoped_explanation(e, mask))
+            .collect())
+    }
+
+    /// `e` as a caller limited to `mask` may have it, or `None` when it must be
+    /// dropped entirely.
+    ///
+    /// Every non-via-hop explanation passes through untouched: its only nodes
+    /// are the two subjects, which [`explain_scoped`](Self::explain_scoped) has
+    /// already checked, and its weight is scored over that pair alone.
+    ///
+    /// A via-hop explanation is kept only when some via node the caller may see
+    /// satisfies the rule on its own — and then its weight is recomputed as the
+    /// max over exactly those vias. The engine writes the max over **all** of
+    /// them (`core-rules::engine`, `best = prev.max(score)`), so passing the
+    /// stored number through would let a hidden node set a figure the caller
+    /// reads: the same disclosure dropping the explanation exists to prevent.
+    ///
+    /// A rule that stores no weight still reports none. The recomputed score is
+    /// a sanitised version of a number `explain` already returned, never a new
+    /// one — a scoped read must not say more than the unscoped read it narrows.
+    fn scoped_explanation(
+        &self,
+        e: Explanation,
+        mask: &crate::mask::NodeMask,
+    ) -> Option<Explanation> {
+        let Some(via_edge) = e.via_edge.clone() else {
+            return Some(e);
+        };
+        let Some(rule_def) = self.engine.rules().find(|r| r.name == e.rule) else {
+            // The rule is gone but its provenance is not; nothing can vouch for
+            // the hop, so nothing is shown.
+            return None;
+        };
+        let Some(via_label) = rule_def.via_label.as_deref() else {
+            return Some(e);
+        };
+        let (Some(src), Some(dst)) = (self.ids.get(&e.src_key), self.ids.get(&e.dst_key)) else {
+            return None;
+        };
+        let (Some(via_etype), Some(via_sym)) = (self.syms.get(&via_edge), self.syms.get(via_label))
+        else {
+            return None;
+        };
+        let via_dir = rule_def.via_dir.unwrap_or(Direction::Out);
+        let props_view = build_props_view(&self.props, &self.base);
+        let dst_get = |field: &str| props_view.get(dst, field).map(|vr| vr.into_value());
+        let dst_view = NodeView {
+            key: &e.dst_key,
+            props: &dst_get,
+        };
+        // The rule's own namespace test, the one the engine applies to each via
+        // candidate (`core-rules::engine::rule_sees_node`). Without it a
+        // visible, out-of-namespace via — right label, satisfying predicate —
+        // vouches for a hop the engine never made, and an explanation whose real
+        // evidence is a hidden in-namespace node is kept.
+        let rule_sees = |id: u32| match rule_def.namespace.as_deref() {
+            None => true,
+            Some(ns) => {
+                let value = props_view.get(id, NS_PROP).map(|vr| vr.into_value());
+                namespace_of_value(value.as_ref()) == ns
+            }
+        };
+        let best = self
+            .topo_view()
+            .neighbors(via_etype, via_dir, src)
+            .iter()
+            .copied()
+            .filter_map(|via| {
+                if !mask.contains_id(via) {
+                    return None;
+                }
+                if self.labels.get(via as usize).copied() != Some(via_sym) {
+                    return None;
+                }
+                if !rule_sees(via) {
+                    return None;
+                }
+                let via_key = self.ids.key_of(via)?;
+                let via_get = |field: &str| props_view.get(via, field).map(|vr| vr.into_value());
+                let via_view = NodeView {
+                    key: via_key,
+                    props: &via_get,
+                };
+                evaluate(&rule_def.predicate, &via_view, &dst_view)
+            })
+            .fold(None::<f64>, |best, score| {
+                Some(match best {
+                    None => score,
+                    Some(prev) => prev.max(score),
+                })
+            })?;
+        let weight = e.weight.map(|_| best);
+        Some(Explanation { weight, ..e })
+    }
+
     pub fn neighbors(&self, key: &str, edge_type: &str, dir: Direction) -> Result<Vec<String>> {
         let id = self
             .ids
@@ -10060,6 +11236,100 @@ impl<F: Fs> GraphDb<F> {
         ))
     }
 
+    /// [`degree`](Self::degree) summing each pair's **insert count** instead of
+    /// counting each pair once (§5.13).
+    ///
+    /// The unique degree asks how many neighbours there are; this asks how many
+    /// times they were inserted. A pair with no recorded count contributes 1,
+    /// so on a store that never called
+    /// [`enable_multiplicity`](Self::enable_multiplicity) this returns exactly
+    /// what [`degree`](Self::degree) returns rather than erroring — the
+    /// distinction is a readout preference, not a demand the store cannot meet.
+    ///
+    /// `AlgoDir::Both` still sums out + in, so a pair visible on both sides
+    /// still contributes twice: multiplicity changes what a pair is worth, never
+    /// how a direction is counted.
+    pub fn degree_multiplicity(
+        &self,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+    ) -> Result<u64> {
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        Ok(Self::multiplicity_directed_degree(
+            &self.topo_view(),
+            &self.edge_props_view(),
+            &self.syms,
+            id,
+            edge_type,
+            direction,
+            None,
+        ))
+    }
+
+    /// [`degree_multiplicity`](Self::degree_multiplicity) under a scope.
+    ///
+    /// The sum covers **visible pairs only**. A hidden neighbour's inserts stay
+    /// out of it for the reason
+    /// [`degree_scoped`](Self::degree_scoped) documents, and more sharply: an
+    /// unscoped multiplicity count discloses not only that a hidden neighbour
+    /// exists but how often it was written.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
+    pub fn degree_scoped_multiplicity(
+        &self,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<u64> {
+        let id = self
+            .ids
+            .get(key)
+            .filter(|&id| mask.contains_id(id))
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        Ok(Self::multiplicity_directed_degree(
+            &self.topo_view(),
+            &self.edge_props_view(),
+            &self.syms,
+            id,
+            edge_type,
+            direction,
+            Some(mask),
+        ))
+    }
+
+    /// [`degree`](Self::degree) counting **only neighbours the mask admits**.
+    ///
+    /// The filter is a correctness requirement, not an optimisation: an
+    /// unfiltered count discloses the existence of a hidden neighbour to a
+    /// caller who cannot see it, which is the same leak
+    /// [`node_edges_scoped`](Self::node_edges_scoped) exists to prevent —
+    /// reached by arithmetic instead of by name.
+    ///
+    /// Hidden or unknown `key` → [`GraphError::KeyNotFound`]. Unknown
+    /// `edge_type` is still 0, as it is unscoped.
+    pub fn degree_scoped(
+        &self,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<u64> {
+        let id = self
+            .ids
+            .get(key)
+            .filter(|&id| mask.contains_id(id))
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        let topo = self.topo_view();
+        Ok(Self::visible_directed_degree(
+            &topo, &self.syms, id, edge_type, direction, mask,
+        ))
+    }
+
     /// Unique directed degree for a subset or a label scan.
     ///
     /// Unknown keys in `keys` are omitted (mask-like). `keys = Some(&[])` →
@@ -10074,6 +11344,105 @@ impl<F: Fs> GraphDb<F> {
         edge_type: Option<&str>,
         direction: crate::algo::AlgoDir,
         limit: Option<usize>,
+    ) -> Result<Vec<(String, u64)>> {
+        self.degrees_inner(
+            keys, label, where_, edge_type, direction, limit, None, false,
+        )
+    }
+
+    /// [`degrees`](Self::degrees) reporting each row's **insert-count** sum
+    /// instead of its unique neighbour count, as
+    /// [`degree_multiplicity`](Self::degree_multiplicity) does for one key.
+    ///
+    /// The sort is still degree descending, key ascending — over the counts this
+    /// reading produces — and `limit` still applies after it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn degrees_multiplicity(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, u64)>> {
+        self.degrees_inner(keys, label, where_, edge_type, direction, limit, None, true)
+    }
+
+    /// [`degrees_scoped`](Self::degrees_scoped) reporting insert counts.
+    ///
+    /// Both filters apply: a hidden key stays out of the result, and every
+    /// row's sum covers its **visible** pairs only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn degrees_scoped_multiplicity(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<(String, u64)>> {
+        self.degrees_inner(
+            keys,
+            label,
+            where_,
+            edge_type,
+            direction,
+            limit,
+            Some(mask),
+            true,
+        )
+    }
+
+    /// [`degrees`](Self::degrees) with the scope applied on both sides: a hidden
+    /// key is omitted from the input — whether it arrived in `keys` or came out
+    /// of the `label`/`where_` scan — and every row's count is the count of its
+    /// **visible** neighbours, for the reason
+    /// [`degree_scoped`](Self::degree_scoped) documents.
+    ///
+    /// Unlike `degree_scoped`, a hidden key here is not
+    /// [`GraphError::KeyNotFound`]: `degrees` already drops unknown keys
+    /// silently, so hidden and absent stay one answer by staying out of the
+    /// result. `limit` still applies after the sort, and so counts visible rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn degrees_scoped(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+        mask: &crate::mask::NodeMask,
+    ) -> Result<Vec<(String, u64)>> {
+        self.degrees_inner(
+            keys,
+            label,
+            where_,
+            edge_type,
+            direction,
+            limit,
+            Some(mask),
+            false,
+        )
+    }
+
+    /// The body shared by [`degrees`](Self::degrees) and
+    /// [`degrees_scoped`](Self::degrees_scoped). `mask = None` is the unscoped
+    /// contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn degrees_inner(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+        mask: Option<&crate::mask::NodeMask>,
+        multiplicity: bool,
     ) -> Result<Vec<(String, u64)>> {
         if let Some(pred) = where_ {
             pred.validate_named("where")
@@ -10111,10 +11480,30 @@ impl<F: Fs> GraphDb<F> {
         };
         let mut out: Vec<(String, u64)> = ids
             .into_iter()
+            // A hidden candidate leaves as quietly as an unknown key does.
+            .filter(|&id| mask.is_none_or(|m| m.contains_id(id)))
             .filter_map(|id| {
                 let key = self.ids.key_of(id)?.to_string();
-                let deg =
-                    Self::unique_directed_degree(&view.topo, view.syms, id, edge_type, direction);
+                let deg = match (multiplicity, mask) {
+                    // The same `view` the unique arms read, so the per-row
+                    // rebuild F9 measured is gone and all three arms agree on
+                    // the state they are reading.
+                    (true, m) => Self::multiplicity_directed_degree(
+                        &view.topo,
+                        &view.edge_props,
+                        view.syms,
+                        id,
+                        edge_type,
+                        direction,
+                        m,
+                    ),
+                    (false, Some(m)) => Self::visible_directed_degree(
+                        &view.topo, view.syms, id, edge_type, direction, m,
+                    ),
+                    (false, None) => Self::unique_directed_degree(
+                        &view.topo, view.syms, id, edge_type, direction,
+                    ),
+                };
                 Some((key, deg))
             })
             .collect();
@@ -10157,6 +11546,104 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// [`unique_directed_degree`](Self::unique_directed_degree) counting only
+    /// neighbours `mask` admits.
+    ///
+    /// Same shape, one substitution: `topo.degree` is a length, so it cannot be
+    /// filtered; the neighbour list it measures can. `Both` still sums out + in,
+    /// so a node visible on both sides still counts twice — the filter changes
+    /// which neighbours are counted, never how a degree is defined.
+    fn visible_directed_degree(
+        topo: &TopologyView<'_>,
+        syms: &Interner,
+        id: u32,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        mask: &crate::mask::NodeMask,
+    ) -> u64 {
+        let dirs: &[Direction] = match direction {
+            crate::algo::AlgoDir::Out => &[Direction::Out],
+            crate::algo::AlgoDir::In => &[Direction::In],
+            crate::algo::AlgoDir::Both => &[Direction::Out, Direction::In],
+        };
+        let visible = |et: u32| -> u64 {
+            dirs.iter()
+                .map(|&d| {
+                    topo.neighbors(et, d, id)
+                        .iter()
+                        .filter(|&&n| mask.contains_id(n))
+                        .count() as u64
+                })
+                .sum()
+        };
+        match edge_type {
+            Some(name) => syms.get(name).map_or(0, visible),
+            None => topo.etypes().map(visible).sum(),
+        }
+    }
+
+    /// Sum of the insert counts of `id`'s pairs (§5.13), over `edge_type` (or
+    /// all types) and `direction`, restricted to what `mask` admits when one is
+    /// given.
+    ///
+    /// The same neighbour lists the unique reading measures, with each entry
+    /// worth its pair's count rather than worth 1 — so the filter decides which
+    /// pairs are in the sum and the count decides what each contributes. A
+    /// direction decides which way round the pair is addressed: an `In`
+    /// neighbour `n` of `id` is the pair `(et, n, id)`.
+    ///
+    /// Takes its views as parameters, exactly as the unique helpers do, because
+    /// it is called once per row from a label scan. `edge_props_view()` reaches
+    /// into the mmap'd base's rkyv section on every call, so building the two
+    /// views inside made an N-row `degrees(multiplicity=True)` do N section
+    /// accesses where the unique reading does one: worth 2.57 ms of 16.68 ms
+    /// over 20 000 rows, about 0.13 us per row (defect #29,
+    /// `tests/f9_bench.rs`). Most of that call's cost is the per-neighbour
+    /// count lookup and is inherent, so this is a hoist, not a rescue.
+    ///
+    /// The views are exactly `self.view()`'s own `topo` and `edge_props`, so a
+    /// caller that already has a view passes its halves and reads the same
+    /// state it reads everything else from.
+    fn multiplicity_directed_degree(
+        topo: &TopologyView<'_>,
+        edge_props: &EdgePropsView<'_>,
+        syms: &Interner,
+        id: u32,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        mask: Option<&crate::mask::NodeMask>,
+    ) -> u64 {
+        let dirs: &[Direction] = match direction {
+            crate::algo::AlgoDir::Out => &[Direction::Out],
+            crate::algo::AlgoDir::In => &[Direction::In],
+            crate::algo::AlgoDir::Both => &[Direction::Out, Direction::In],
+        };
+        let count_of = |et: u32, src: u32, dst: u32| -> u64 {
+            match edge_props.get(et, src, dst, EDGE_COUNT_PROP) {
+                Some(Value::Int(n)) if n > 0 => n as u64,
+                _ => 1,
+            }
+        };
+        let per_etype = |et: u32| -> u64 {
+            dirs.iter()
+                .map(|&d| {
+                    topo.neighbors(et, d, id)
+                        .iter()
+                        .filter(|&&n| mask.is_none_or(|m| m.contains_id(n)))
+                        .map(|&n| match d {
+                            Direction::Out => count_of(et, id, n),
+                            Direction::In => count_of(et, n, id),
+                        })
+                        .sum::<u64>()
+                })
+                .sum()
+        };
+        match edge_type {
+            Some(name) => syms.get(name).map_or(0, per_etype),
+            None => topo.etypes().map(per_etype).sum(),
+        }
+    }
+
     /// Return the last-change commit sequence for `key`, or `None` if the node
     /// does not exist or has never been mutated since the last V5-V7 snapshot
     /// (horizon-bounded for legacy stores).
@@ -10173,6 +11660,17 @@ impl<F: Fs> GraphDb<F> {
     pub fn last_changed(&self, key: &str) -> Option<u64> {
         let id = self.ids.get(key)?;
         self.last_change.get(&id).copied()
+    }
+
+    /// Which loaded store this handle is.
+    ///
+    /// Paired with [`commit_seq`](GraphDb::commit_seq) it identifies a graph
+    /// state outright, which `commit_seq` alone does not: two stores of the same
+    /// age share a sequence, and a reload can return to one. Memos of dense
+    /// node ids that the handle does not own are stamped with both; see
+    /// [`StoreStamp`](crate::mask::StoreStamp).
+    pub(crate) fn store_id(&self) -> crate::mask::StoreId {
+        self.store_id
     }
 
     /// The current commit sequence (number of successful commits since open,
@@ -10233,7 +11731,7 @@ impl<F: Fs> GraphDb<F> {
         ops: Vec<BatchOp>,
     ) -> Result<(usize, usize)> {
         self.check_preconditions(&preconds)?;
-        self.commit_logged_batch(ops, None, None)
+        self.commit_logged_batch(ops, None, None).map(inserted_pair)
     }
 
     /// Update the per-node last-change map for a WAL record at commit `seq`.
@@ -10281,6 +11779,15 @@ impl<F: Fs> GraphDb<F> {
                 self.last_change.insert(*src, seq);
                 self.last_change.insert(*dst, seq);
             }
+            // A count record touches the pair, so it touches both endpoints —
+            // the same reading `InsertEdgeId` gets, because a duplicate insert
+            // that raises the count *is* a mutation of that pair. The opt-in
+            // declaration touches nothing.
+            WalRecord::SetEdgeCount { src, dst, .. } if !rec.is_multiplicity_decl() => {
+                self.last_change.insert(*src, seq);
+                self.last_change.insert(*dst, seq);
+            }
+            WalRecord::SetEdgeCount { .. } => {}
             // DeleteNode: node is tombstoned; last_changed(key) returns None for
             // deleted keys (ids.get() returns None post-tombstone), so no update needed.
             // History markers: state no-ops; the underlying mutation already
@@ -11523,7 +13030,23 @@ impl<F: Fs> GraphDb<F> {
         self.started_at
     }
 
-    /// On-disk snapshot format version this binary writes and reads.
+    /// The on-disk snapshot version a store that has opted in to nothing
+    /// writes — the **floor**, not the whole answer.
+    ///
+    /// It is not "the version this binary writes", and it is not "the version
+    /// this binary reads". Since v0.6.10 this binary writes 9 **or** 10
+    /// depending on the store — [`snapshot::version_for`] decides, and a store
+    /// that has called [`enable_multiplicity`](Self::enable_multiplicity)
+    /// writes 10 — and it reads 5 through 10. A caller comparing a store's
+    /// stamp against this value must use `>=`, not `==`, or it will report an
+    /// opted-in store as needing a migration *down*; `cli::run_migrate` is the
+    /// worked example.
+    ///
+    /// The name is kept for compatibility: it is public API reachable from the
+    /// CLI and from any embedder, and respelling it would break them for a
+    /// doc-level clarification.
+    ///
+    /// [`snapshot::version_for`]: core_storage::snapshot::version_for
     pub fn format_version() -> u16 {
         core_storage::snapshot::VERSION
     }
@@ -11597,7 +13120,21 @@ impl<F: Fs> GraphDb<F> {
         // legacy store (may have been truncated in an older code version) from a
         // new store that only used keep_wal=true.  Conservative: refuse genesis in
         // both cases.  Must be sampled here, before the snapshot write below.
-        let had_prior_snapshot = self.fs.snapshot_path().map(|p| p.exists()).unwrap_or(false);
+        //
+        // `snapshot_preserved_history` is the one case where the answer is not a
+        // guess: a snapshot *this handle* took, on a store that had none when it
+        // opened, and that kept the WAL. The proxy defers to it, because
+        // otherwise `enable_multiplicity` — whose forced snapshot is exactly
+        // that — would permanently disqualify the store from a genesis chain it
+        // is fully entitled to (defect #23).
+        let had_prior_snapshot = self.fs.snapshot_path().map(|p| p.exists()).unwrap_or(false)
+            && !self.snapshot_preserved_history;
+        // Which version this store writes. V9 unless it has opted in to
+        // multiplicity, in which case V10 — the stamp that makes a reader which
+        // does not know WAL discriminant 23 refuse the open instead of
+        // truncating the WAL at the first such frame. The container is
+        // identical either way; only these two header bytes move.
+        let snapshot_version = core_storage::snapshot::version_for(self.multiplicity);
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
         self.engine.ensure_provenance_loaded_mut();
@@ -11718,6 +13255,7 @@ impl<F: Fs> GraphDb<F> {
                     &mut buf,
                 )?;
             }
+            core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written snapshot as the new base.
             // C2: use file mmap on RealFs; fall back to from_bytes on SimFs.
@@ -11779,6 +13317,7 @@ impl<F: Fs> GraphDb<F> {
             // meta (and the moved edge_props inside it) is no longer needed;
             // drop it before the write to keep the peak window narrow.
             drop(meta);
+            core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written V8 snapshot as self.base.
             // On RealFs: drop the encode buffer before mmap to recover ~1.9 GiB.
@@ -11845,6 +13384,46 @@ impl<F: Fs> GraphDb<F> {
                 + live_frames_for_name.len() as u64;
             self.fs.archive_wal(archive_n)?;
 
+            // The replacement WAL goes in **immediately**, with no fallible call
+            // between it and the rename above.
+            //
+            // The rename is what removes the store's live declarations — the
+            // multiplicity opt-in, and every `EnableFulltext` / `EnableIndex` —
+            // and this write is what puts them back. Every call that used to sit
+            // in between (the genesis marker, the retention sweep's reads, the
+            // floor write, the archive deletes) was a `?` that could leave the
+            // store with neither, so a single transient `Err` was enough to lose
+            // a declaration that no rebuild can recover (defect #22).
+            //
+            // Ordering alone cannot close the crash window between two
+            // filesystem calls; for the multiplicity declaration the V10 stamp
+            // does that on the open path. What ordering does close is the much
+            // wider window in which an ordinary I/O error did it — and that half
+            // covers all three declarations, not just the one with a stamp.
+            let mut baseline_wal: Vec<u8> = Vec::new();
+            // The multiplicity opt-in is a declaration like the two below it,
+            // and it is re-emitted for the same reason: truncation must not
+            // silently opt the store back out and stop counting.
+            if self.multiplicity {
+                baseline_wal
+                    .extend_from_slice(&encode_record(&core_storage::wal::MULTIPLICITY_ENABLED));
+            }
+            for (label, field) in self.fulltext.enabled_pairs() {
+                let rec = WalRecord::EnableFulltext {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            for (label, field) in self.prop_index.enabled_pairs() {
+                let rec = WalRecord::EnableIndex {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
+
             // Genesis marker: written once when the first archive is taken
             // from a store that has never undergone a WAL-truncating snapshot.
             // When present, `open_at` may replay archive-resident commits from
@@ -11862,6 +13441,11 @@ impl<F: Fs> GraphDb<F> {
             //      may have truncated the WAL), the same conservative refusal applies:
             //      we cannot prove the chain is complete, so we refuse genesis (cost =
             //      no as-of-through-archives; never silent wrong data).
+            //      The one exception is a snapshot this handle took itself, on a store
+            //      that had none when it opened, with the WAL kept: there the answer is
+            //      known rather than guessed, and `snapshot_preserved_history` says so.
+            //      Without that exception `enable_multiplicity`'s forced keep_wal
+            //      snapshot would disqualify the store forever (defect #23).
             //      On SimFs (snapshot_path() == None) had_prior_snapshot is always false,
             //      so SimFs always passes this check.
             if is_first_archive && !had_prior_snapshot {
@@ -11914,24 +13498,6 @@ impl<F: Fs> GraphDb<F> {
                     }
                 }
             }
-
-            // Write new minimal baseline WAL (mirrors the keep_wal=false path).
-            let mut baseline_wal: Vec<u8> = Vec::new();
-            for (label, field) in self.fulltext.enabled_pairs() {
-                let rec = WalRecord::EnableFulltext {
-                    label: label.clone(),
-                    field: field.clone(),
-                };
-                baseline_wal.extend_from_slice(&encode_record(&rec));
-            }
-            for (label, field) in self.prop_index.enabled_pairs() {
-                let rec = WalRecord::EnableIndex {
-                    label: label.clone(),
-                    field: field.clone(),
-                };
-                baseline_wal.extend_from_slice(&encode_record(&rec));
-            }
-            self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
         } else if opts.keep_wal {
             // keep_wal=true: WAL is left untouched.  The existing WAL already
             // contains the EnableFulltext records from the original enable calls;
@@ -11959,7 +13525,18 @@ impl<F: Fs> GraphDb<F> {
                 self.fs.delete_genesis_marker()?;
                 self.archive_genesis_chain = false;
             }
+            // And this handle can no longer prove the WAL is whole: it is about
+            // to truncate it itself. Same-session archives after this point get
+            // the conservative answer, exactly as cross-session ones do.
+            self.snapshot_preserved_history = false;
             let mut baseline_wal: Vec<u8> = Vec::new();
+            // The multiplicity opt-in is a declaration like the two below it,
+            // and it is re-emitted for the same reason: truncation must not
+            // silently opt the store back out and stop counting.
+            if self.multiplicity {
+                baseline_wal
+                    .extend_from_slice(&encode_record(&core_storage::wal::MULTIPLICITY_ENABLED));
+            }
             for (label, field) in self.fulltext.enabled_pairs() {
                 let rec = WalRecord::EnableFulltext {
                     label: label.clone(),
@@ -11989,6 +13566,108 @@ impl<F: Fs> GraphDb<F> {
         self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
         Ok(())
     }
+}
+
+/// What a batch node insert does when its key is already taken.
+///
+/// A mirror rebuild writes a frame onto a store that already has content, so
+/// "the key exists" is a routine answer rather than a failure. The decision is
+/// made during the batch's existing validate pass, from one id-map lookup per
+/// row, so the frame stays atomic and re-ingest stays O(n).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnConflict {
+    /// Refuse the whole frame with [`GraphError::DuplicateKey`]. The default,
+    /// and the only behaviour before v0.6.10.
+    #[default]
+    Error,
+    /// Leave the stored node exactly as it is — properties, label and edges —
+    /// and count it in [`BatchOutcome::skipped`].
+    Skip,
+    /// Keep the key and make the node's properties **exactly** the supplied
+    /// props: supplied fields are set, fields absent from the supplied props
+    /// are removed. A supplied label that differs from the stored one, and a
+    /// supplied `ns` that would move the node, are row errors — relabelling is
+    /// [`GraphDb::rename_node`], not a side effect of a rebuild.
+    ///
+    /// Two properties are outside "exactly", both because they are not the
+    /// caller's to supply:
+    ///
+    /// - `ns` is immutable, so an omitted `ns` leaves the node where it is
+    ///   rather than moving it to `default`;
+    /// - a property a **view** owns is kept, not removed. Supplying one is a
+    ///   row error, so omitting it cannot be a request to delete it, and
+    ///   refusing the row instead would make `Replace` impossible for the whole
+    ///   population a view has written to. Each such field kept is counted in
+    ///   [`BatchOutcome::kept_view_owned`] — the row is still `replaced` and
+    ///   still raises no row error, so that count is the only signal a caller
+    ///   gets that the stored node carries a field its frame did not describe.
+    Replace,
+}
+
+/// What one [`OnConflict::Replace`] row resolves to.
+///
+/// The property writes that make the node exactly the supplied props —
+/// `Some(value)` is a set, `None` a removal — paired with how many view-owned
+/// fields the row kept instead of removing, which is the one way the result is
+/// not exactly the supplied props. See [`MutPreview::plan_replace`].
+type ReplacePlan = (Vec<(String, Option<Value>)>, usize);
+
+/// What one committed batch did.
+///
+/// [`BatchBuilder::commit`] returns the first two fields as a tuple; the rest
+/// exist for [`OnConflict`] and are always zero / empty without it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BatchOutcome {
+    /// Node records actually written.
+    pub nodes_inserted: usize,
+    /// Edge records actually written. A duplicate edge is a silent no-op under
+    /// every policy — adjacency is a set — and is not counted.
+    pub edges_inserted: usize,
+    /// Rows whose key was taken and whose policy was [`OnConflict::Skip`].
+    pub skipped: usize,
+    /// Rows whose key was taken and whose policy was [`OnConflict::Replace`].
+    pub replaced: usize,
+    /// View-owned properties an [`OnConflict::Replace`] row **kept** although
+    /// the caller did not supply them — counted per field, so one row that
+    /// keeps two contributes two.
+    ///
+    /// This is the one respect in which `Replace` does not make a node's props
+    /// exactly the supplied ones (see [`OnConflict::Replace`]). Those rows
+    /// still count in `replaced` and still raise no `row_errors`, because
+    /// nothing went wrong: a view's property is not the caller's to supply or
+    /// to remove. A mirror rebuild that needs its copy to be byte-exact reads
+    /// this to learn that the store kept fields its frame did not describe.
+    pub kept_view_owned: usize,
+    /// `(row, why)` for rows an [`OnConflict::Replace`] refused. `row` counts
+    /// node-insert ops in this batch from zero, which for a caller that queues
+    /// its nodes in order is the index of the offending node. The rest of the
+    /// frame still commits; the refused row changes nothing.
+    pub row_errors: Vec<(usize, String)>,
+}
+
+/// The `(nodes_inserted, edges_inserted)` pair every pre-0.6.10 commit entry
+/// point returns. Keeps those signatures unchanged now that the validate pass
+/// produces a [`BatchOutcome`].
+fn inserted_pair(outcome: BatchOutcome) -> (usize, usize) {
+    (outcome.nodes_inserted, outcome.edges_inserted)
+}
+
+/// One entry of a frame the validate pass has decided on, before
+/// [`GraphDb::rewrite_wal_dense_planned`] turns it into dense-id records.
+///
+/// Almost every entry is already a finished [`WalRecord`]. The exception is a
+/// duplicate edge insert: its count names a dense triple, and on the batch path
+/// the endpoints and the edge type may all be created by earlier records in the
+/// *same* frame, so no id for them exists until the dense rewrite allocates it.
+/// Carrying the keys this far and resolving them there is what lets the count
+/// survive the shape a mirror rebuild writes (defect #24).
+enum PlannedRec {
+    Rec(WalRecord),
+    DuplicateCount {
+        edge_type: String,
+        src_key: String,
+        dst_key: String,
+    },
 }
 
 /// Queued mutation for a [`BatchBuilder`] or [`GraphDb::commit_group`].
@@ -12042,6 +13721,16 @@ pub enum BatchOp {
         dst_key: String,
         placeholder_label: String,
     },
+    /// Insert `key`, or — when the key is already taken — do what `on_conflict`
+    /// says. Queued by [`BatchBuilder::insert_node_on_conflict`]; `Error`
+    /// queues a plain [`BatchOp::InsertNode`] instead, so this variant only
+    /// ever carries `Skip` or `Replace`.
+    InsertNodeOnConflict {
+        label: String,
+        key: String,
+        props: Vec<(String, Value)>,
+        on_conflict: OnConflict,
+    },
 }
 
 /// Three-way node visibility status used by `check_single_op_authz`.
@@ -12059,6 +13748,10 @@ enum NodeAuthzStatus {
 #[derive(Default)]
 struct Overlay {
     extra_keys: BTreeSet<String>,
+    /// Label of each node inserted earlier in this batch. The store does not
+    /// have these keys yet, so `label_of` cannot answer for them, and
+    /// `OnConflict::Replace` has to compare labels.
+    extra_labels: BTreeMap<String, String>,
     deleted_keys: BTreeSet<String>,
     extra_props: BTreeMap<(String, String), Value>,
     removed_props: BTreeSet<(String, String)>,
@@ -12237,7 +13930,32 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         false
     }
 
-    fn check_insert_node(&self, key: &str) -> Result<()> {
+    /// The refusals a node creation makes, in the order it makes them.
+    ///
+    /// A view owns its property, and creating a node that carries one is a
+    /// write to it exactly as `set_prop` is — so it is refused here, at the one
+    /// choke-point `GraphDb::insert_node`, `BatchOp::InsertNode` and the
+    /// no-conflict arm of `BatchOp::InsertNodeOnConflict` all pass through.
+    ///
+    /// Leaving creation exempt was not harmless. The value was stored and
+    /// served: a created node the view has no reason to revisit keeps the
+    /// caller's number for the life of the handle, and the backfill at the next
+    /// open overwrites it — so the store answered `deg = 777` before a restart
+    /// and `deg = 0` after, for a property every other surface calls read-only.
+    /// It also split one op two ways: supplying a view-owned field under
+    /// `OnConflict::Replace` was already a row error on a taken key while the
+    /// same field on a fresh key was accepted.
+    ///
+    /// Checked before the key, like [`MutPreview::prepare_remove_prop`], so the
+    /// answer does not depend on whether the key exists.
+    fn check_insert_node(&self, key: &str, props: &[(String, Value)]) -> Result<()> {
+        for (field, _) in props {
+            if let Some(view_name) = self.db.view_store.view_for_prop(field) {
+                return Err(GraphError::ViewPropReadOnly {
+                    view_name: view_name.to_string(),
+                });
+            }
+        }
         if self.has_key(key) {
             Err(GraphError::DuplicateKey { key: key.into() })
         } else {
@@ -12281,6 +13999,19 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     }
 
     fn prepare_remove_prop(&self, key: &str, field: &str) -> Result<bool> {
+        // A view owns its property, and the refusal has to live here rather
+        // than on `GraphDb::remove_prop`: `BatchOp::RemoveProp` never meets
+        // that one, and it is what the HTTP `DELETE /node/{key}/prop/{field}`
+        // route, `Batch::remove_prop` and the CLI all submit. This is the one
+        // choke-point every removal passes, exactly as it is for `ns` below.
+        // Checked before the key, so the answer does not depend on whether the
+        // key exists — which is also what `GraphDb::remove_prop` answered when
+        // it carried the only copy of this guard.
+        if let Some(view_name) = self.db.view_store.view_for_prop(field) {
+            return Err(GraphError::ViewPropReadOnly {
+                view_name: view_name.to_string(),
+            });
+        }
         self.check_live_key(key)?;
         // Removing `ns` is changing the namespace — to `default`, the namespace
         // an absent property names. It goes through this one choke-point and NOT
@@ -12387,6 +14118,138 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.db.syms.resolve(sym).map(str::to_string)
     }
 
+    /// The label `key` carries as this batch sees it — including a node
+    /// inserted earlier in the same batch, which the store does not have yet.
+    fn label_in_batch(&self, key: &str) -> Option<String> {
+        if self.overlay.deleted_keys.contains(key) {
+            return None;
+        }
+        if let Some(label) = self.overlay.extra_labels.get(key) {
+            return Some(label.clone());
+        }
+        self.label_of(key)
+    }
+
+    /// The property writes that make `key`'s props exactly `props`, or why the
+    /// row is refused.
+    ///
+    /// `Some(value)` is a set and `None` is a removal. `store_fields` is every
+    /// field name the store knows, hoisted by the caller so a frame of N
+    /// replaces reads the field list once rather than N times.
+    ///
+    /// The second half of the pair is how many view-owned fields this row kept
+    /// rather than removed — the one part of "exactly the supplied props" that
+    /// does not hold, and the caller's only signal that it did not.
+    ///
+    /// The refusals are row errors, not frame errors: a mirror rebuild should
+    /// learn which of its rows disagree with the store without losing the rows
+    /// that agree.
+    fn plan_replace(
+        &self,
+        label: &str,
+        key: &str,
+        props: &[(String, Value)],
+        store_fields: &[String],
+    ) -> std::result::Result<ReplacePlan, String> {
+        // A different label is a relabel, and a rebuild does not relabel: that
+        // is `rename_node` or an explicit write, never a side effect here.
+        let stored = self.label_in_batch(key).unwrap_or_default();
+        if stored != label {
+            return Err(format!(
+                "node {key}: on_conflict=\"replace\" will not relabel {stored:?} to {label:?}; \
+                 relabelling is rename_node or an explicit write"
+            ));
+        }
+        // `ns` is immutable. Replace removes what the supplied props omit, so
+        // an omitted `ns` is a move to `default` exactly as a different `ns` is
+        // a move to that one; both are the same refusal.
+        let from = self.namespace_in_batch(key);
+        let to = match props.iter().find(|(field, _)| field == NS_PROP) {
+            Some((_, Value::Str(ns))) => ns.clone(),
+            Some((_, value)) => {
+                return Err(format!(
+                    "node {key}: {NS_PROP} must be a string naming a namespace, got {value:?}"
+                ));
+            }
+            None => NS_DEFAULT.to_string(),
+        };
+        if to != from {
+            return Err(format!(
+                "node {key}: {NS_PROP} is immutable; on_conflict=\"replace\" cannot move it \
+                 from {from:?} to {to:?}"
+            ));
+        }
+
+        if let Some(why) = self.supplied_view_owned_prop(key, props) {
+            return Err(why);
+        }
+
+        let supplied: BTreeSet<&str> = props.iter().map(|(field, _)| field.as_str()).collect();
+        let mut writes = Vec::new();
+        for (field, value) in props {
+            // `ns` names the namespace the node is already in, so the write is
+            // the no-op the dense-rewrite seam would drop anyway.
+            if field == NS_PROP {
+                continue;
+            }
+            // Already exactly this value: a rebuild of an unchanged row should
+            // cost no WAL record.
+            if self.prop_value(key, field).as_ref() == Some(value) {
+                continue;
+            }
+            writes.push((field.clone(), Some(value.clone())));
+        }
+        // Everything the node still carries that the supplied props do not.
+        // `ns` is never removed: it is immutable, and the check above has
+        // already established the node stays where it is.
+        let overlay_fields = self
+            .overlay
+            .extra_props
+            .keys()
+            .filter(|(k, _)| k == key)
+            .map(|(_, field)| field.as_str());
+        //
+        // A view-owned field is filtered out rather than refused. It is not the
+        // caller's to supply (supplying one is still the row error above) and
+        // so it is not part of what "exactly the supplied ones" ranges over:
+        // omitting it is not a request to delete it. Refusing here instead
+        // would make `replace` impossible for every node a view has written to
+        // — which on a store carrying a view is the whole population a mirror
+        // rebuild has to cover.
+        let omitted: BTreeSet<&str> = store_fields
+            .iter()
+            .map(String::as_str)
+            .chain(overlay_fields)
+            .filter(|field| {
+                *field != NS_PROP && !supplied.contains(field) && self.has_prop(key, field)
+            })
+            .collect();
+        // The view-owned half is kept, and counted: the row still commits and
+        // still reports no error, so without this number a mirror rebuild is
+        // told it got exactly what it asked for when it did not (defect #18).
+        let (stale, kept): (Vec<&str>, Vec<&str>) = omitted
+            .into_iter()
+            .partition(|field| self.db.view_store.view_for_prop(field).is_none());
+        writes.extend(stale.into_iter().map(|field| (field.to_string(), None)));
+        Ok((writes, kept.len()))
+    }
+
+    /// The row error a supplied view-owned field earns, or `None`.
+    ///
+    /// Shared by [`MutPreview::plan_replace`] and the no-conflict arm of
+    /// `BatchOp::InsertNodeOnConflict` so that one op answers a supplied
+    /// view-owned field the same way whether or not the key was already taken.
+    fn supplied_view_owned_prop(&self, key: &str, props: &[(String, Value)]) -> Option<String> {
+        props.iter().find_map(|(field, _)| {
+            self.db.view_store.view_for_prop(field).map(|view_name| {
+                format!(
+                    "node {key}: property {field:?} is owned by view {view_name:?} and is \
+                     read-only"
+                )
+            })
+        })
+    }
+
     /// The namespace `key` is in as this batch sees it — including a node
     /// inserted earlier in the same batch, which the store does not have yet.
     fn namespace_in_batch(&self, key: &str) -> String {
@@ -12459,9 +14322,12 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         }
     }
 
-    fn note_insert_node(&mut self, key: &str, props: &[(String, Value)]) {
+    fn note_insert_node(&mut self, label: &str, key: &str, props: &[(String, Value)]) {
         self.overlay.deleted_keys.remove(key);
         self.overlay.extra_keys.insert(key.to_string());
+        self.overlay
+            .extra_labels
+            .insert(key.to_string(), label.to_string());
         self.overlay.extra_props.retain(|(k, _), _| k != key);
         self.overlay.removed_props.retain(|(k, _)| k != key);
         for (field, value) in props {
@@ -12629,6 +14495,33 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
         self
     }
 
+    /// Queue a node insert whose answer to a taken key is `on_conflict`.
+    ///
+    /// [`OnConflict::Error`] queues exactly the op [`insert_node`](Self::insert_node)
+    /// does, so the default path is unchanged.
+    pub fn insert_node_on_conflict(
+        &mut self,
+        label: &str,
+        key: &str,
+        props: Vec<(String, Value)>,
+        on_conflict: OnConflict,
+    ) -> &mut Self {
+        self.ops.push(match on_conflict {
+            OnConflict::Error => BatchOp::InsertNode {
+                label: label.into(),
+                key: key.into(),
+                props,
+            },
+            on_conflict => BatchOp::InsertNodeOnConflict {
+                label: label.into(),
+                key: key.into(),
+                props,
+                on_conflict,
+            },
+        });
+        self
+    }
+
     pub fn insert_edge(&mut self, edge_type: &str, src_key: &str, dst_key: &str) -> &mut Self {
         self.ops.push(BatchOp::InsertEdge {
             edge_type: edge_type.into(),
@@ -12735,12 +14628,20 @@ impl<'a, F: Fs> BatchBuilder<'a, F> {
         self.db.commit_batch(ops)
     }
 
+    /// [`commit`](Self::commit) with the full [`BatchOutcome`] — the counts a
+    /// caller needs when its rows carry an [`OnConflict`] policy.
+    pub fn commit_outcome(&mut self) -> Result<BatchOutcome> {
+        let ops = std::mem::take(&mut self.ops);
+        self.db.commit_logged_batch(ops, None, None)
+    }
+
     /// Same as [`commit`](Self::commit) but tail the inner events with
     /// [`MutationEvent::Ingested`] instead of [`MutationEvent::BatchApplied`].
     pub(crate) fn commit_ingest(&mut self, label: &str, inserted: usize) -> Result<(usize, usize)> {
         let ops = std::mem::take(&mut self.ops);
         self.db
             .commit_logged_batch(ops, Some((label.to_string(), inserted)), None)
+            .map(inserted_pair)
     }
 }
 

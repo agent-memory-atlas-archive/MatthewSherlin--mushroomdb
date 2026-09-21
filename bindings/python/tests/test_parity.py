@@ -482,6 +482,8 @@ def test_mushroom_busy_is_a_runtime_error(tmp_path):
 # Every method the binding exposes must carry a docstring and a text signature.
 _DOCUMENTED = [
     "open",
+    "enable_multiplicity",
+    "is_multiplicity_enabled",
     "insert_node",
     "upsert_node",
     "insert_edge",

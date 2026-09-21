@@ -84,11 +84,23 @@ impl VisibleSet {
         let Some(&max) = ids.iter().max() else {
             return VisibleSet::Sparse(HashSet::new());
         };
-        let span = max as usize + 1;
+        // `+ 1` saturates: on a 32-bit `usize`, `u32::MAX as usize + 1`
+        // overflows — panicking in debug, and in release wrapping to 0, which
+        // would take the dense branch with a zero-length word vector and panic
+        // on the first write. Saturating keeps the arithmetic honest on every
+        // target; a 32-bit build then reads the span as `usize::MAX`, which
+        // sends a mask that large to `Sparse`, the correct answer for it.
+        let span = (max as usize).saturating_add(1);
         // `ids.len()` counts duplicates, so it is only an upper bound on the
         // population — enough to rule *out* a bitset, never enough to rule one
         // in. When it passes, the bitset itself does the deduplication and the
         // rule is re-checked on the count that comes out of it.
+        //
+        // The *allocation* below is sized from that inflated count, so a list
+        // of many duplicates plus one high id can briefly allocate a bitset
+        // that `from_words` then demotes. Bounded by the store's id space, and
+        // the outcome is still correct — but the rule seeing the distinct
+        // count is true of the result, not of the transient.
         if ids.len().saturating_mul(64) < span {
             return VisibleSet::Sparse(ids.into_iter().collect());
         }

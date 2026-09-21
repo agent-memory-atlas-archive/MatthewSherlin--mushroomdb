@@ -137,7 +137,7 @@ fn build_epv<'a>(
 fn make_view<'a>(
     state: &'a FrozenOverlay,
     base: &'a Option<Arc<MappedBase>>,
-    mask: Option<&'a HashSet<u32>>,
+    mask: Option<&'a core_query::visible::VisibleSet>,
 ) -> GraphView<'a> {
     GraphView {
         ids: &state.ids,

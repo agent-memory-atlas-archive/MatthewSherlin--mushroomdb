@@ -1,3 +1,4 @@
+use core_query::visible::VisibleSet;
 use core_storage::fs::Fs;
 use core_storage::Result;
 use std::collections::{HashMap, HashSet};
@@ -42,7 +43,10 @@ pub enum MaskMode {
 /// An empty mask hides every node.
 #[derive(Clone, Debug)]
 pub struct NodeMask {
-    pub(crate) visible: HashSet<u32>,
+    /// The allow-list, in whichever shape [`VisibleSet`]'s density rule picked
+    /// for it at construction. Every masked read probes this once per
+    /// candidate, which is what makes the shape worth choosing.
+    pub(crate) visible: VisibleSet,
     mode: MaskMode,
 }
 
@@ -101,7 +105,7 @@ impl NodeMask {
     /// means stubs must never slip through an intersection.
     pub fn intersect(&self, other: &NodeMask) -> NodeMask {
         NodeMask {
-            visible: self.visible.intersection(&other.visible).copied().collect(),
+            visible: self.visible.intersect(&other.visible),
             mode: MaskMode::Omit,
         }
     }
@@ -110,8 +114,9 @@ impl NodeMask {
     ///
     /// Used by `ReaderSnapshot` handlers where the key has already been resolved
     /// to a dense id (avoids a second lookup into a `GraphDb`).
+    #[inline]
     pub fn contains_id(&self, id: u32) -> bool {
-        self.visible.contains(&id)
+        self.visible.contains(id)
     }
 
     /// Return `true` if the node identified by `key` is visible in this mask.
@@ -127,7 +132,7 @@ impl NodeMask {
     ) -> bool {
         db.ids()
             .get(key)
-            .is_some_and(|id| self.visible.contains(&id))
+            .is_some_and(|id| self.visible.contains(id))
     }
 }
 

@@ -10118,7 +10118,7 @@ impl<F: Fs> GraphDb<F> {
         let mut out: Vec<(String, f64)> = hits
             .iter()
             .copied()
-            .filter(|&(id, _)| mask.visible.contains(&id))
+            .filter(|&(id, _)| mask.contains_id(id))
             .filter_map(|(id, _)| {
                 let sim = exact_vector_similarity(&view, id, field, q_unit)?;
                 if sim < min {

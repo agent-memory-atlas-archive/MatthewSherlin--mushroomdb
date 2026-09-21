@@ -1,7 +1,8 @@
 use core_storage::property_index::PropertyIndex;
 use core_storage::v8::seam::{ColumnsView, EdgePropsView, TopologyView, ValueRef};
 use core_storage::{IdMap, Interner, Value};
-use std::collections::HashSet;
+
+use crate::visible::VisibleSet;
 
 /// Read-only twin of `GraphMut`. Holds only borrowed graph state.
 pub struct GraphView<'a> {
@@ -23,7 +24,10 @@ pub struct GraphView<'a> {
     pub edge_props: EdgePropsView<'a>,
     /// Optional query-scoped node visibility set. `None` = all nodes visible.
     /// When `Some(set)`, only dense ids present in `set` are accessible.
-    pub mask: Option<&'a HashSet<u32>>,
+    ///
+    /// [`VisibleSet`] carries its own representation choice, so this field is
+    /// one probe whichever shape the mask took; see that type for the rule.
+    pub mask: Option<&'a VisibleSet>,
     /// Optional equality index over scalar properties. `Some` on the primary
     /// locked read path; `None` for MVCC reader snapshots (which fall back to a
     /// scan). `IndexScan` consults it only when the `(label, field)` is declared.
@@ -35,7 +39,7 @@ impl<'a> GraphView<'a> {
     /// Always `true` when no mask is set.
     #[inline]
     pub fn visible(&self, id: u32) -> bool {
-        self.mask.is_none_or(|m| m.contains(&id))
+        self.mask.is_none_or(|m| m.contains(id))
     }
 
     pub fn node_id(&self, key: &str) -> Option<u32> {
@@ -113,7 +117,7 @@ impl<'a> GraphView<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::GraphView;
+    use super::{GraphView, VisibleSet};
     use core_storage::v8::seam::{ColumnsView, EdgePropsView, TopologyView};
     use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology, Value};
 
@@ -231,7 +235,6 @@ mod tests {
 
     #[test]
     fn nodes_all_respects_mask() {
-        use std::collections::HashSet;
         let mut fx = Fx::new();
         let alice = fx.add("Person", "alice", vec![]);
         let bob = fx.add("Person", "bob", vec![]);
@@ -245,7 +248,7 @@ mod tests {
         assert!(all.contains(&carol));
 
         // Masked: only alice and carol visible.
-        let visible: HashSet<u32> = [alice, carol].into_iter().collect();
+        let visible: VisibleSet = [alice, carol].into_iter().collect();
         let v_masked = GraphView {
             ids: &fx.ids,
             syms: &fx.syms,

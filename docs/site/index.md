@@ -78,7 +78,7 @@ Docker, `install.sh`, and the build-from-source path are in
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
-- [MCP tools](mcp.md) — the fourteen task tools, the thirteen graph tools, and the listing each store gets
+- [MCP tools](mcp.md) — the fourteen task tools, the fourteen graph tools, and the listing each store gets
 - [The association benchmark](association-bench.md) — one world in three forms, the twenty questions, and the gate
 - [The live code graph](code-graph.md) — **deprecated in 0.6.4, removed in 0.7**: what the repository graph guarantees, measured
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`

@@ -51,9 +51,9 @@ mushroomdb mcp ./db       # stdio MCP JSON-RPC server for agent tools
 ```
 
 The default `tools/list` follows the store: three tools on one built by
-`ingest-git` (`explore`, `query`, `stats`), fifteen on any other; all 27 stay
+`ingest-git` (`explore`, `query`, `stats`), sixteen on any other; all 28 stay
 callable by name either way and `mushroomdb mcp <db> --all-tools` lists them all.
-The 13 graph tools below are prefixed `Advanced:`.
+The 14 graph tools below are prefixed `Advanced:`.
 
 ## Repository as a data source (deprecated door)
 
@@ -204,7 +204,7 @@ only this process's writes. Poll if you must react to a hook's writes.
 
 Reference: docs/site/concurrency.md
 
-## MCP tools (27 total: 14 task + 13 graph)
+## MCP tools (28 total: 14 task + 14 graph)
 
 Task tools, in the order `tools/list` serves them (all callable on any store):
 `explore`, `map`, `context`, `impact`, `owners`, `why` and `sync` read a code
@@ -213,7 +213,7 @@ graph; `explain_association`, `node_edges`, `neighborhood`, `edges_at` and
 returns the rendered digest as its text content; `json: true` swaps in the report
 instead. See the "Repository as a data source (deprecated door)" section above.
 
-The 13 graph tools below are the graph API itself; their `tools/list`
+The 14 graph tools below are the graph API itself; their `tools/list`
 descriptions are prefixed `Advanced:`.
 
 
@@ -225,6 +225,7 @@ descriptions are prefixed `Advanced:`.
 | `explain` | Explain rule-derived edges between two nodes |
 | `upsert_entity` | Insert or update a node by key (no existence check needed) |
 | `find_similar` | (1) Vector search via HNSW; (2) edge-traversal neighbors |
+| `pairwise_similar` | Exact cosine top-k among a caller `keys` set on one `field`; never HNSW. Self excluded; `distance = 1 - sim` is the caller's conversion |
 | `hybrid_search` | RRF over fulltext + vector results |
 | `node_info` | Node key, label, properties |
 | `stats` | Live node/edge/rule counts |

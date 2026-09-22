@@ -1,7 +1,7 @@
 //! The fourteen MCP tools that answer a question in prose rather than in JSON.
 //!
 //! `explore`, `map`, `context`, `impact`, `owners`, `why`, `recall`,
-//! `remember` and `sync` sit in front of the thirteen graph tools in
+//! `remember` and `sync` sit in front of the fourteen graph tools in
 //! `mcp::tools_list`, because they are what an assistant working in a checkout
 //! actually reaches for: find me this thing, what is this repository, what is
 //! this symbol, what does my diff touch, who wrote this, why are these two
